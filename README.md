@@ -88,6 +88,18 @@ Run:
 sudo dnf install -y gtk4 libadwaita
 ```
 
+### Gentoo
+
+Build:
+```
+sudo emerge --ask dev-lang/rust dev-util/pkgconf x11-libs/gtk gui-libs/libadwaita
+```
+
+Run:
+```
+sudo emerge --ask x11-libs/gtk gui-libs/libadwaita
+```
+
 ### Nix / NixOS
 
 Build (ephemeral dev shell):
