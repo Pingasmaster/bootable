@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, Context, Result};
 use gtk::glib;
 use std::env;
@@ -23,24 +25,24 @@ pub fn helper_plan_path() -> Option<PathBuf> {
     None
 }
 
-pub fn run_helper(plan_path: PathBuf) -> glib::ExitCode {
+pub fn run_helper(plan_path: &Path) -> glib::ExitCode {
     if !is_root() {
         eprintln!("Helper must run as root");
         return glib::ExitCode::FAILURE;
     }
 
-    match read_plan(&plan_path) {
+    match read_plan(plan_path) {
         Ok(plan) => {
-            let _ = fs::remove_file(&plan_path);
+            let _ = fs::remove_file(plan_path);
             let mut stdout = std::io::stdout();
             let mut ok = true;
             let mut emit = |event: UiEvent| {
                 match event {
                     UiEvent::Log(msg) => {
-                        let _ = writeln!(stdout, "LOG\t{}", msg);
+                        let _ = writeln!(stdout, "LOG\t{msg}");
                     }
                     UiEvent::Progress(frac) => {
-                        let _ = writeln!(stdout, "PROGRESS\t{:.6}", frac);
+                        let _ = writeln!(stdout, "PROGRESS\t{frac:.6}");
                     }
                     UiEvent::Done(result) => match result {
                         Ok(()) => {
@@ -48,14 +50,14 @@ pub fn run_helper(plan_path: PathBuf) -> glib::ExitCode {
                         }
                         Err(err) => {
                             ok = false;
-                            let _ = writeln!(stdout, "DONE\tERR\t{}", err);
+                            let _ = writeln!(stdout, "DONE\tERR\t{err}");
                         }
                     },
                 }
                 let _ = stdout.flush();
             };
 
-            crate::writer::run(plan, &mut emit);
+            crate::writer::run(&plan, &mut emit);
             if ok {
                 glib::ExitCode::SUCCESS
             } else {
@@ -63,7 +65,7 @@ pub fn run_helper(plan_path: PathBuf) -> glib::ExitCode {
             }
         }
         Err(err) => {
-            let _ = fs::remove_file(&plan_path);
+            let _ = fs::remove_file(plan_path);
             eprintln!("Failed to read plan: {err}");
             glib::ExitCode::FAILURE
         }
@@ -92,7 +94,7 @@ where
         "LC_ALL",
     ] {
         if let Ok(val) = env::var(key) {
-            cmd.arg(format!("{}={}", key, val));
+            cmd.arg(format!("{key}={val}"));
         }
     }
     cmd.arg(exe);
@@ -124,7 +126,7 @@ where
     let err_thread = thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
-            let _ = tx_err.send(UiEvent::Log(format!("helper: {}", line)));
+            let _ = tx_err.send(UiEvent::Log(format!("helper: {line}")));
         }
     });
 
@@ -148,8 +150,7 @@ where
             emit(UiEvent::Done(Ok(())));
         } else {
             emit(UiEvent::Done(Err(format!(
-                "Helper exited with status {}",
-                status
+                "Helper exited with status {status}"
             ))));
         }
     }
@@ -158,7 +159,8 @@ where
 }
 
 fn read_plan(path: &Path) -> Result<WritePlan> {
-    let data = fs::read(path).with_context(|| format!("reading plan {}", path.display()))?;
+    let data = fs::read(path)
+        .with_context(|| format!("reading plan {path}", path = path.display()))?;
     serde_json::from_slice(&data).context("parsing plan JSON")
 }
 

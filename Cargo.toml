@@ -2,6 +2,12 @@
 name = "bootable"
 version = "0.1.0"
 edition = "2024"
+description = "Graphical USB image writer for bootable media"
+license = "GPL-3.0-only"
+repository = "https://github.com/Pingasmaster/bootable"
+readme = "README.md"
+keywords = ["usb", "boot", "image", "iso", "gui"]
+categories = ["filesystem", "gui"]
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.11.0-alpha.2", features = ["v4_20"] }

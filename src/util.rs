@@ -1,5 +1,8 @@
+#![forbid(unsafe_code)]
+
 use std::process::Command;
 
+#[allow(clippy::cast_precision_loss)]
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = bytes as f64;
@@ -16,7 +19,7 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 pub fn command_exists(cmd: &str) -> bool {
-    let script = format!("command -v {} >/dev/null 2>&1", cmd);
+    let script = format!("command -v {cmd} >/dev/null 2>&1");
     Command::new("sh")
         .arg("-c")
         .arg(script)

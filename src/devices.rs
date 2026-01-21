@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::process::Command;
@@ -33,7 +35,7 @@ struct BlockDevice {
     rm: Option<bool>,
     path: Option<String>,
     mountpoints: Option<Vec<Option<String>>>,
-    children: Option<Vec<BlockDevice>>,
+    children: Option<Vec<Self>>,
 }
 
 pub fn list_removable() -> Result<Vec<Device>> {
@@ -67,18 +69,18 @@ pub fn list_removable() -> Result<Vec<Device>> {
         let path = match dev.path.clone() {
             Some(path) => path,
             None => match dev.name.as_ref() {
-                Some(name) => format!("/dev/{}", name),
+                Some(name) => format!("/dev/{name}"),
                 None => continue,
             },
         };
         let size = dev.size;
-        let size_display = size.map(format_bytes).unwrap_or_else(|| "unknown".to_string());
+        let size_display = size.map_or_else(|| "unknown".to_string(), format_bytes);
         let model = dev.model.unwrap_or_else(|| "Unknown".to_string());
-        let tran = dev.tran.unwrap_or_else(|| "".to_string());
+        let tran = dev.tran.unwrap_or_else(String::new);
         let display = if tran.is_empty() {
-            format!("{} • {} • {}", path, size_display, model)
+            format!("{path} • {size_display} • {model}")
         } else {
-            format!("{} • {} • {} ({})", path, size_display, model, tran)
+            format!("{path} • {size_display} • {model} ({tran})")
         };
         devices.push(Device {
             path,
@@ -157,7 +159,7 @@ fn collect_partition_mounts(device: &BlockDevice, out: &mut Vec<MountPoint>) {
             let path = match device.path.clone() {
                 Some(path) => path,
                 None => match device.name.as_ref() {
-                    Some(name) => format!("/dev/{}", name),
+                    Some(name) => format!("/dev/{name}"),
                     None => continue,
                 },
             };

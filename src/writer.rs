@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -64,7 +66,7 @@ pub enum UiEvent {
     Done(Result<(), String>),
 }
 
-pub fn run<F>(plan: WritePlan, mut emit: F)
+pub fn run<F>(plan: &WritePlan, mut emit: F)
 where
     F: FnMut(UiEvent),
 {
@@ -75,13 +77,13 @@ where
         }
 
         let mode = match plan.image_mode {
-            ImageMode::Auto => detect_image_mode(&plan.iso_path, &mut emit)?,
+            ImageMode::Auto => detect_image_mode(&plan.iso_path, &mut emit),
             other => other,
         };
 
         match mode {
-            ImageMode::IsoHybridDd => write_dd(&plan, &mut emit),
-            ImageMode::WindowsUefi => write_windows_uefi(&plan, &mut emit),
+            ImageMode::IsoHybridDd => write_dd(plan, &mut emit),
+            ImageMode::WindowsUefi => write_windows_uefi(plan, &mut emit),
             ImageMode::Auto => unreachable!(),
         }
     })();
@@ -89,12 +91,12 @@ where
     emit(UiEvent::Done(result.map_err(|err| err.to_string())));
 }
 
-fn detect_image_mode(path: &Path, emit: &mut dyn FnMut(UiEvent)) -> Result<ImageMode> {
+fn detect_image_mode(path: &Path, emit: &mut dyn FnMut(UiEvent)) -> ImageMode {
     if let Some(listing) = iso_listing(path) {
         let listing_lc = listing.to_lowercase();
         if listing_lc.contains("sources/install.wim") || listing_lc.contains("sources/install.esd") {
             log(emit, "Detected Windows ISO".to_string());
-            return Ok(ImageMode::WindowsUefi);
+            return ImageMode::WindowsUefi;
         }
     } else {
         log(
@@ -103,7 +105,7 @@ fn detect_image_mode(path: &Path, emit: &mut dyn FnMut(UiEvent)) -> Result<Image
         );
     }
 
-    Ok(ImageMode::IsoHybridDd)
+    ImageMode::IsoHybridDd
 }
 
 fn iso_listing(path: &Path) -> Option<String> {
@@ -147,7 +149,7 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     let mut dst = OpenOptions::new()
         .write(true)
         .open(&plan.device_path)
-        .with_context(|| format!("opening device {}", plan.device_path))?;
+        .with_context(|| format!("opening device {device_path}", device_path = plan.device_path))?;
 
     let total = iso_size.max(1);
     let mut written: u64 = 0;
@@ -163,6 +165,7 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
         written += read as u64;
 
         if last_update.elapsed() >= Duration::from_millis(200) {
+            #[allow(clippy::cast_precision_loss)]
             let frac = (written as f64) / (total as f64);
             emit(UiEvent::Progress(frac));
             last_update = Instant::now();
@@ -193,7 +196,7 @@ fn write_windows_uefi(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result
 fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     for cmd in ["parted", "mkfs.vfat", "mount", "umount", "rsync"] {
         if !command_exists(cmd) {
-            bail!("Required tool not found: {}", cmd);
+            bail!("Required tool not found: {cmd}");
         }
     }
 
@@ -206,14 +209,14 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
     let partition = partition_path(&plan.device_path);
     let label = sanitize_fat_label(&plan.volume_label);
     log(emit, "Waiting for partition device".to_string());
-    wait_for_device_node(&partition).with_context(|| format!("waiting for {}", partition))?;
+    wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
 
     log(emit, "Formatting FAT32".to_string());
     let mkfs_args = vec![
         "-F".to_string(),
         "32".to_string(),
         "-n".to_string(),
-        label.clone(),
+        label,
         partition.clone(),
     ];
     run_cmd(emit, "mkfs.vfat", &mkfs_args, "mkfs.vfat")?;
@@ -232,7 +235,7 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
 
     log(emit, "Mounting USB".to_string());
     let mount_usb_args = vec![
-        partition.clone(),
+        partition,
         usb_dir.path().to_string_lossy().to_string(),
     ];
     if let Err(err) = run_cmd(emit, "mount", &mount_usb_args, "mount USB") {
@@ -246,8 +249,14 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
             "-aH".to_string(),
             "--exclude=/sources/install.wim".to_string(),
             "--exclude=/sources/install.esd".to_string(),
-            format!("{}/", iso_dir.path().to_string_lossy()),
-            format!("{}/", usb_dir.path().to_string_lossy()),
+            format!(
+                "{path}/",
+                path = iso_dir.path().to_string_lossy()
+            ),
+            format!(
+                "{path}/",
+                path = usb_dir.path().to_string_lossy()
+            ),
         ];
         run_cmd(emit, "rsync", &rsync_args, "rsync")?;
 
@@ -280,6 +289,7 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     if plan.partition_scheme != PartitionScheme::Gpt {
         bail!("UEFI:NTFS requires GPT partition scheme");
@@ -295,7 +305,7 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
 
     for cmd in ["parted", "mkfs.vfat", "mount", "umount", "rsync"] {
         if !command_exists(cmd) {
-            bail!("Required tool not found: {}", cmd);
+            bail!("Required tool not found: {cmd}");
         }
     }
 
@@ -324,8 +334,8 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     let esp_partition = partition_path_for(&plan.device_path, 1);
     let data_partition = partition_path_for(&plan.device_path, 2);
     log(emit, "Waiting for partition devices".to_string());
-    wait_for_device_node(&esp_partition).with_context(|| format!("waiting for {}", esp_partition))?;
-    wait_for_device_node(&data_partition).with_context(|| format!("waiting for {}", data_partition))?;
+    wait_for_device_node(&esp_partition).with_context(|| format!("waiting for {esp_partition}"))?;
+    wait_for_device_node(&data_partition).with_context(|| format!("waiting for {data_partition}"))?;
 
     let esp_label = "BOOT".to_string();
     let ntfs_label = sanitize_ntfs_label(&plan.volume_label);
@@ -335,7 +345,7 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
         "-F".to_string(),
         "32".to_string(),
         "-n".to_string(),
-        esp_label.clone(),
+        esp_label,
         esp_partition.clone(),
     ];
     run_cmd(emit, "mkfs.vfat", &mkfs_args, "mkfs.vfat")?;
@@ -364,7 +374,7 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
 
     log(emit, "Mounting ESP".to_string());
     let mount_esp_args = vec![
-        esp_partition.clone(),
+        esp_partition,
         esp_dir.path().to_string_lossy().to_string(),
     ];
     if let Err(err) = run_cmd(emit, "mount", &mount_esp_args, "mount ESP") {
@@ -374,7 +384,7 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
 
     log(emit, "Mounting NTFS".to_string());
     let mount_data_args = vec![
-        data_partition.clone(),
+        data_partition,
         data_dir.path().to_string_lossy().to_string(),
     ];
     if let Err(err) = run_cmd(emit, "mount", &mount_data_args, "mount NTFS") {
@@ -467,11 +477,13 @@ fn handle_wim(wim_path: &Path, usb_root: &Path, emit: &mut dyn FnMut(UiEvent)) -
 }
 
 fn copy_file_buffered(src: &Path, dst: &Path) -> Result<()> {
-    let mut input = File::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let mut input =
+        File::open(src).with_context(|| format!("opening {path}", path = src.display()))?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).ok();
     }
-    let mut output = File::create(dst).with_context(|| format!("creating {}", dst.display()))?;
+    let mut output =
+        File::create(dst).with_context(|| format!("creating {path}", path = dst.display()))?;
     let mut buffer = vec![0u8; 4 * 1024 * 1024];
     loop {
         let read = input.read(&mut buffer).context("reading input file")?;
@@ -566,7 +578,7 @@ fn create_windows_partitions_ntfs(device: &str, emit: &mut dyn FnMut(UiEvent)) -
 
 fn unmount_device(device_path: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     let mounts = devices::partitions_with_mountpoints(device_path)
-        .with_context(|| format!("listing mountpoints for {}", device_path))?;
+        .with_context(|| format!("listing mountpoints for {device_path}"))?;
     if mounts.is_empty() {
         return Ok(());
     }
@@ -574,13 +586,17 @@ fn unmount_device(device_path: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()
     for mount in mounts {
         log(
             emit,
-            format!("Unmounting {} ({})", mount.mountpoint, mount.path),
+            format!(
+                "Unmounting {mountpoint} ({path})",
+                mountpoint = mount.mountpoint,
+                path = &mount.path
+            ),
         );
         if command_exists("udisksctl") {
             let args = vec![
                 "unmount".to_string(),
                 "-b".to_string(),
-                mount.path.clone(),
+                mount.path,
             ];
             if run_cmd(emit, "udisksctl", &args, "udisksctl unmount").is_ok() {
                 continue;
@@ -590,7 +606,7 @@ fn unmount_device(device_path: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()
         let status = Command::new("umount")
             .arg(&mount.mountpoint)
             .status()
-            .with_context(|| format!("umount {}", mount.mountpoint))?;
+            .with_context(|| format!("umount {mountpoint}", mountpoint = mount.mountpoint))?;
         if !status.success() {
             bail!("Failed to unmount {}", mount.mountpoint);
         }
@@ -626,7 +642,7 @@ fn wait_for_device_node(path: &str) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    bail!("Timed out waiting for {}", path)
+    bail!("Timed out waiting for {path}")
 }
 
 fn run_cmd(
@@ -635,19 +651,16 @@ fn run_cmd(
     args: &[String],
     context: &str,
 ) -> Result<()> {
-    log(emit, format!("Running: {}", context));
+    log(emit, format!("Running: {context}"));
     let output = Command::new(program)
         .args(args)
         .output()
-        .with_context(|| format!("running {}", program))?;
+        .with_context(|| format!("running {program}"))?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(anyhow!(
-            "{} failed: {}",
-            context,
-            String::from_utf8_lossy(&output.stderr)
-        ))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow!("{context} failed: {stderr}"))
     }
 }
 
@@ -657,8 +670,8 @@ fn run_rsync_with_progress(
     dst: &Path,
 ) -> Result<()> {
     let version = rsync_version();
-    let supports_progress2 = version.map(|v| v >= (3, 1, 0)).unwrap_or(true);
-    let supports_no_inc = version.map(|v| v >= (3, 1, 0)).unwrap_or(true);
+    let supports_progress2 = version.is_none_or(|v| v >= (3, 1, 0));
+    let supports_no_inc = version.is_none_or(|v| v >= (3, 1, 0));
 
     let mut args = vec!["-aH".to_string()];
     if supports_progress2 {
@@ -669,8 +682,8 @@ fn run_rsync_with_progress(
     } else {
         args.push("--progress".to_string());
     }
-    args.push(format!("{}/", src.to_string_lossy()));
-    args.push(format!("{}/", dst.to_string_lossy()));
+    args.push(format!("{path}/", path = src.to_string_lossy()));
+    args.push(format!("{path}/", path = dst.to_string_lossy()));
 
     let mut cmd = Command::new("rsync");
     cmd.args(&args);
@@ -702,7 +715,7 @@ fn run_rsync_with_progress(
     if status.success() {
         Ok(())
     } else {
-        Err(anyhow!("rsync failed: {}", status))
+        Err(anyhow!("rsync failed: {status}"))
     }
 }
 
@@ -748,7 +761,7 @@ fn handle_rsync_line(
         if emit_logs && !is_rsync_progress_line(line) {
             let trimmed = line.trim_end_matches(['\r', '\n']);
             if !trimmed.is_empty() {
-                let _ = tx.send(UiEvent::Log(format!("rsync: {}", trimmed)));
+                let _ = tx.send(UiEvent::Log(format!("rsync: {trimmed}")));
             }
         }
         return;
@@ -757,7 +770,7 @@ fn handle_rsync_line(
     if emit_logs {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if !trimmed.is_empty() {
-            let _ = tx.send(UiEvent::Log(format!("rsync: {}", trimmed)));
+            let _ = tx.send(UiEvent::Log(format!("rsync: {trimmed}")));
         }
     }
 }
@@ -819,15 +832,11 @@ fn partition_path(device: &str) -> String {
 }
 
 fn partition_path_for(device: &str, index: u8) -> String {
-    let ends_with_digit = device
-        .chars()
-        .last()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false);
+    let ends_with_digit = device.chars().last().is_some_and(|c| c.is_ascii_digit());
     if ends_with_digit {
-        format!("{}p{}", device, index)
+        format!("{device}p{index}")
     } else {
-        format!("{}{}", device, index)
+        format!("{device}{index}")
     }
 }
 
@@ -874,49 +883,49 @@ enum BootArch {
 }
 
 impl BootArch {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
-            BootArch::X64 => "x86_64",
-            BootArch::Ia32 => "ia32",
-            BootArch::Aa64 => "aa64",
+            Self::X64 => "x86_64",
+            Self::Ia32 => "ia32",
+            Self::Aa64 => "aa64",
         }
     }
 
-    fn grub_target(self) -> &'static str {
+    const fn grub_target(self) -> &'static str {
         match self {
-            BootArch::X64 => "x86_64-efi",
-            BootArch::Ia32 => "i386-efi",
-            BootArch::Aa64 => "arm64-efi",
+            Self::X64 => "x86_64-efi",
+            Self::Ia32 => "i386-efi",
+            Self::Aa64 => "arm64-efi",
         }
     }
 
-    fn module_dir(self) -> &'static str {
+    const fn module_dir(self) -> &'static str {
         match self {
-            BootArch::X64 => "x86_64-efi",
-            BootArch::Ia32 => "i386-efi",
-            BootArch::Aa64 => "arm64-efi",
+            Self::X64 => "x86_64-efi",
+            Self::Ia32 => "i386-efi",
+            Self::Aa64 => "arm64-efi",
         }
     }
 
-    fn boot_filename(self) -> &'static str {
+    const fn boot_filename(self) -> &'static str {
         match self {
-            BootArch::X64 => "BOOTX64.EFI",
-            BootArch::Ia32 => "BOOTIA32.EFI",
-            BootArch::Aa64 => "BOOTAA64.EFI",
+            Self::X64 => "BOOTX64.EFI",
+            Self::Ia32 => "BOOTIA32.EFI",
+            Self::Aa64 => "BOOTAA64.EFI",
         }
     }
 
-    fn grub_filename(self) -> &'static str {
+    const fn grub_filename(self) -> &'static str {
         match self {
-            BootArch::X64 => "grubx64.efi",
-            BootArch::Ia32 => "grubia32.efi",
-            BootArch::Aa64 => "grubaa64.efi",
+            Self::X64 => "grubx64.efi",
+            Self::Ia32 => "grubia32.efi",
+            Self::Aa64 => "grubaa64.efi",
         }
     }
 
     fn signed_shim_candidates(self) -> Vec<&'static str> {
         match self {
-            BootArch::X64 => vec![
+            Self::X64 => vec![
                 "/usr/lib/shim/shimx64.efi",
                 "/usr/lib/shim/shimx64.efi.signed",
                 "/usr/lib64/shim/shimx64.efi",
@@ -928,7 +937,7 @@ impl BootArch {
                 "/usr/lib/shim-signed/shimx64.efi.signed",
                 "/usr/lib64/shim-signed/shimx64.efi.signed",
             ],
-            BootArch::Ia32 => vec![
+            Self::Ia32 => vec![
                 "/usr/lib/shim/shimia32.efi",
                 "/usr/lib/shim/shimia32.efi.signed",
                 "/usr/lib64/shim/shimia32.efi",
@@ -940,7 +949,7 @@ impl BootArch {
                 "/usr/lib/shim-signed/shimia32.efi.signed",
                 "/usr/lib64/shim-signed/shimia32.efi.signed",
             ],
-            BootArch::Aa64 => vec![
+            Self::Aa64 => vec![
                 "/usr/lib/shim/shimaa64.efi",
                 "/usr/lib/shim/shimaa64.efi.signed",
                 "/usr/lib64/shim/shimaa64.efi",
@@ -957,7 +966,7 @@ impl BootArch {
 
     fn signed_grub_candidates(self) -> Vec<&'static str> {
         match self {
-            BootArch::X64 => vec![
+            Self::X64 => vec![
                 "/usr/lib/grub/x86_64-efi-signed/grubx64.efi",
                 "/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed",
                 "/usr/lib64/grub/x86_64-efi-signed/grubx64.efi",
@@ -965,7 +974,7 @@ impl BootArch {
                 "/usr/share/grub/x86_64-efi-signed/grubx64.efi",
                 "/usr/share/grub/x86_64-efi-signed/grubx64.efi.signed",
             ],
-            BootArch::Ia32 => vec![
+            Self::Ia32 => vec![
                 "/usr/lib/grub/i386-efi-signed/grubia32.efi",
                 "/usr/lib/grub/i386-efi-signed/grubia32.efi.signed",
                 "/usr/lib64/grub/i386-efi-signed/grubia32.efi",
@@ -973,7 +982,7 @@ impl BootArch {
                 "/usr/share/grub/i386-efi-signed/grubia32.efi",
                 "/usr/share/grub/i386-efi-signed/grubia32.efi.signed",
             ],
-            BootArch::Aa64 => vec![
+            Self::Aa64 => vec![
                 "/usr/lib/grub/arm64-efi-signed/grubaa64.efi",
                 "/usr/lib/grub/arm64-efi-signed/grubaa64.efi.signed",
                 "/usr/lib64/grub/arm64-efi-signed/grubaa64.efi",
@@ -986,19 +995,19 @@ impl BootArch {
 
     fn mok_manager_candidates(self) -> Vec<&'static str> {
         match self {
-            BootArch::X64 => vec![
+            Self::X64 => vec![
                 "/usr/lib/shim/mmx64.efi",
                 "/usr/lib64/shim/mmx64.efi",
                 "/usr/share/shim/mmx64.efi",
                 "/usr/share/efi/shim/mmx64.efi",
             ],
-            BootArch::Ia32 => vec![
+            Self::Ia32 => vec![
                 "/usr/lib/shim/mmia32.efi",
                 "/usr/lib64/shim/mmia32.efi",
                 "/usr/share/shim/mmia32.efi",
                 "/usr/share/efi/shim/mmia32.efi",
             ],
-            BootArch::Aa64 => vec![
+            Self::Aa64 => vec![
                 "/usr/lib/shim/mmaa64.efi",
                 "/usr/lib64/shim/mmaa64.efi",
                 "/usr/share/shim/mmaa64.efi",
@@ -1034,9 +1043,9 @@ fn find_first_existing(candidates: &[&str]) -> Option<PathBuf> {
 
 fn find_grub_module_dir(arch: BootArch) -> Option<PathBuf> {
     let candidates = [
-        format!("/usr/lib/grub/{}", arch.module_dir()),
-        format!("/usr/lib64/grub/{}", arch.module_dir()),
-        format!("/usr/share/grub/{}", arch.module_dir()),
+        format!("/usr/lib/grub/{module_dir}", module_dir = arch.module_dir()),
+        format!("/usr/lib64/grub/{module_dir}", module_dir = arch.module_dir()),
+        format!("/usr/share/grub/{module_dir}", module_dir = arch.module_dir()),
     ];
     for path in &candidates {
         let candidate = Path::new(path);
@@ -1065,19 +1074,17 @@ fn signed_bootloader_ready(arch: BootArch) -> bool {
     if find_signed_bootloader(arch).is_none() {
         return false;
     }
-    match find_grub_module_dir(arch) {
-        Some(dir) => modules_present(&dir),
-        None => false,
-    }
+    find_grub_module_dir(arch).is_some_and(|dir| modules_present(&dir))
 }
 
 fn copy_grub_modules(arch: BootArch, esp_root: &Path) -> Result<()> {
+    let arch_label = arch.label();
     let source = find_grub_module_dir(arch)
-        .ok_or_else(|| anyhow!("grub modules not found for {}", arch.label()))?;
+        .ok_or_else(|| anyhow!("grub modules not found for {arch_label}"))?;
     if !modules_present(&source) {
         return Err(anyhow!(
-            "grub modules missing in {}",
-            source.display()
+            "grub modules missing in {path}",
+            path = source.display()
         ));
     }
     let target = esp_root.join("boot/grub").join(arch.module_dir());
@@ -1090,13 +1097,18 @@ fn copy_grub_modules(arch: BootArch, esp_root: &Path) -> Result<()> {
         {
             let dest = target.join(name);
             fs::copy(&path, &dest).with_context(|| {
-                format!("copying grub module {} to {}", path.display(), dest.display())
+                format!(
+                    "copying grub module {src} to {dst}",
+                    src = path.display(),
+                    dst = dest.display()
+                )
             })?;
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn install_uefi_ntfs_loaders(
     esp_root: &Path,
     ntfs_label: &str,
@@ -1107,8 +1119,7 @@ fn install_uefi_ntfs_loaders(
     fs::create_dir_all(&grub_dir).context("creating EFI/BOOT")?;
 
     let grub_cfg = format!(
-        "if [ \"${{grub_cpu}}\" = \"x86_64\" ]; then\n  search --no-floppy --file /EFI/BOOT/BOOTX64.EFI --set=esp\nelif [ \"${{grub_cpu}}\" = \"i386\" ]; then\n  search --no-floppy --file /EFI/BOOT/BOOTIA32.EFI --set=esp\nelif [ \"${{grub_cpu}}\" = \"arm64\" ]; then\n  search --no-floppy --file /EFI/BOOT/BOOTAA64.EFI --set=esp\nfi\nif [ -n \"$esp\" ]; then\n  set prefix=($esp)/boot/grub\nfi\ninsmod part_gpt\ninsmod part_msdos\ninsmod fat\ninsmod ntfs\ninsmod chain\ninsmod search_fs_label\nsearch --no-floppy --label \"{}\" --set=root\nif [ \"${{grub_cpu}}\" = \"x86_64\" ]; then\n  if [ -f /EFI/BOOT/BOOTX64.EFI ]; then\n    chainloader /EFI/BOOT/BOOTX64.EFI\n    boot\n  fi\n  if [ -f /efi/boot/bootx64.efi ]; then\n    chainloader /efi/boot/bootx64.efi\n    boot\n  fi\nelif [ \"${{grub_cpu}}\" = \"i386\" ]; then\n  if [ -f /EFI/BOOT/BOOTIA32.EFI ]; then\n    chainloader /EFI/BOOT/BOOTIA32.EFI\n    boot\n  fi\n  if [ -f /efi/boot/bootia32.efi ]; then\n    chainloader /efi/boot/bootia32.efi\n    boot\n  fi\nelif [ \"${{grub_cpu}}\" = \"arm64\" ]; then\n  if [ -f /EFI/BOOT/BOOTAA64.EFI ]; then\n    chainloader /EFI/BOOT/BOOTAA64.EFI\n    boot\n  fi\n  if [ -f /efi/boot/bootaa64.efi ]; then\n    chainloader /efi/boot/bootaa64.efi\n    boot\n  fi\nfi\necho \"Windows bootloader not found\"\nsleep 5\n",
-        ntfs_label
+        "if [ \"${{grub_cpu}}\" = \"x86_64\" ]; then\n  search --no-floppy --file /EFI/BOOT/BOOTX64.EFI --set=esp\nelif [ \"${{grub_cpu}}\" = \"i386\" ]; then\n  search --no-floppy --file /EFI/BOOT/BOOTIA32.EFI --set=esp\nelif [ \"${{grub_cpu}}\" = \"arm64\" ]; then\n  search --no-floppy --file /EFI/BOOT/BOOTAA64.EFI --set=esp\nfi\nif [ -n \"$esp\" ]; then\n  set prefix=($esp)/boot/grub\nfi\ninsmod part_gpt\ninsmod part_msdos\ninsmod fat\ninsmod ntfs\ninsmod chain\ninsmod search_fs_label\nsearch --no-floppy --label \"{ntfs_label}\" --set=root\nif [ \"${{grub_cpu}}\" = \"x86_64\" ]; then\n  if [ -f /EFI/BOOT/BOOTX64.EFI ]; then\n    chainloader /EFI/BOOT/BOOTX64.EFI\n    boot\n  fi\n  if [ -f /efi/boot/bootx64.efi ]; then\n    chainloader /efi/boot/bootx64.efi\n    boot\n  fi\nelif [ \"${{grub_cpu}}\" = \"i386\" ]; then\n  if [ -f /EFI/BOOT/BOOTIA32.EFI ]; then\n    chainloader /EFI/BOOT/BOOTIA32.EFI\n    boot\n  fi\n  if [ -f /efi/boot/bootia32.efi ]; then\n    chainloader /efi/boot/bootia32.efi\n    boot\n  fi\nelif [ \"${{grub_cpu}}\" = \"arm64\" ]; then\n  if [ -f /EFI/BOOT/BOOTAA64.EFI ]; then\n    chainloader /EFI/BOOT/BOOTAA64.EFI\n    boot\n  fi\n  if [ -f /efi/boot/bootaa64.efi ]; then\n    chainloader /efi/boot/bootaa64.efi\n    boot\n  fi\nfi\necho \"Windows bootloader not found\"\nsleep 5\n"
     );
 
     fs::write(grub_dir.join("grub.cfg"), grub_cfg.as_bytes()).context("writing grub.cfg")?;
@@ -1131,11 +1142,11 @@ fn install_uefi_ntfs_loaders(
     if let Some(signed) = find_signed_bootloader(BootArch::X64) {
         if let Err(err) = copy_grub_modules(BootArch::X64, esp_root) {
             if secure_only {
-                bail!("Secure Boot enforced but GRUB modules missing: {}", err);
+                bail!("Secure Boot enforced but GRUB modules missing: {err}");
             }
             log(
                 emit,
-                format!("Signed GRUB modules missing, falling back to unsigned: {}", err),
+                format!("Signed GRUB modules missing, falling back to unsigned: {err}"),
             );
         } else {
             log(emit, "Using signed shim/grub for x86_64".to_string());
@@ -1165,34 +1176,30 @@ fn install_uefi_ntfs_loaders(
     }
 
     for arch in [BootArch::Ia32, BootArch::Aa64] {
+        let arch_label = arch.label();
         if let Some(signed) = find_signed_bootloader(arch) {
             if let Err(err) = copy_grub_modules(arch, esp_root) {
                 log(
                     emit,
                     format!(
-                        "Skipping signed {} loader (modules missing: {})",
-                        arch.label(),
-                        err
+                        "Skipping signed {arch_label} loader (modules missing: {err})"
                     ),
                 );
                 if secure_only {
                     continue;
                 }
             } else {
-            log(
-                emit,
-                format!("Using signed shim/grub for {}", arch.label()),
-            );
-            let _ = copy_efi(&signed.shim, &grub_dir.join(arch.boot_filename()));
-            let _ = copy_efi(&signed.grub, &grub_dir.join(arch.grub_filename()));
-            if let Some(mok) = signed.mok {
-                let target = grub_dir.join(
-                    mok.file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new("mmx.efi")),
-                );
-                let _ = copy_efi(&mok, &target);
-            }
-            continue;
+                log(emit, format!("Using signed shim/grub for {arch_label}"));
+                let _ = copy_efi(&signed.shim, &grub_dir.join(arch.boot_filename()));
+                let _ = copy_efi(&signed.grub, &grub_dir.join(arch.grub_filename()));
+                if let Some(mok) = signed.mok {
+                    let target = grub_dir.join(
+                        mok.file_name()
+                            .unwrap_or_else(|| std::ffi::OsStr::new("mmx.efi")),
+                    );
+                    let _ = copy_efi(&mok, &target);
+                }
+                continue;
             }
         }
 
@@ -1200,8 +1207,7 @@ fn install_uefi_ntfs_loaders(
             log(
                 emit,
                 format!(
-                    "Skipping {} loader (grub-mkstandalone not available)",
-                    arch.label()
+                    "Skipping {arch_label} loader (grub-mkstandalone not available)"
                 ),
             );
             continue;
@@ -1211,8 +1217,7 @@ fn install_uefi_ntfs_loaders(
             log(
                 emit,
                 format!(
-                    "Secure Boot enforced; skipping unsigned {} loader",
-                    arch.label()
+                    "Secure Boot enforced; skipping unsigned {arch_label} loader"
                 ),
             );
             continue;
@@ -1224,10 +1229,7 @@ fn install_uefi_ntfs_loaders(
             &cfg_path,
             emit,
         ) {
-            log(
-                emit,
-                format!("Failed to build {} loader: {}", arch.label(), err),
-            );
+            log(emit, format!("Failed to build {arch_label} loader: {err}"));
         }
     }
 
@@ -1247,7 +1249,10 @@ fn build_grub_standalone(
         "-o".to_string(),
         output_path.to_string_lossy().to_string(),
         "--modules=part_gpt part_msdos fat ntfs chain search_fs_label".to_string(),
-        format!("boot/grub/grub.cfg={}", cfg_path.to_string_lossy()),
+        format!(
+            "boot/grub/grub.cfg={cfg}",
+            cfg = cfg_path.to_string_lossy()
+        ),
     ];
     run_cmd(emit, "grub-mkstandalone", &args, "grub-mkstandalone")
 }
@@ -1256,7 +1261,13 @@ fn copy_efi(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::copy(src, dst).with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+    fs::copy(src, dst).with_context(|| {
+        format!(
+            "copying {src} to {dst}",
+            src = src.display(),
+            dst = dst.display()
+        )
+    })?;
     Ok(())
 }
 

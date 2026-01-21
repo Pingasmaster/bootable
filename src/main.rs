@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod devices;
 mod helper;
 mod util;
@@ -9,13 +11,15 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::Duration;
 use glib::types::StaticType;
+use gio::prelude::VolumeMonitorExt;
 
 use crate::writer::{FileSystem, ImageMode, PartitionScheme, TargetSystem, UiEvent, WritePlan};
 
 fn main() -> glib::ExitCode {
     if let Some(plan_path) = helper::helper_plan_path() {
-        return helper::run_helper(plan_path);
+        return helper::run_helper(&plan_path);
     }
 
     let app = adw::Application::builder()
@@ -25,6 +29,7 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -73,24 +78,24 @@ fn build_ui(app: &adw::Application) {
         "ISOHybrid / DD",
         "Windows (UEFI/FAT32)",
     ]);
-    let mode_dropdown = gtk::DropDown::new(Some(mode_list.clone()), None::<&gtk::Expression>);
+    let mode_dropdown = gtk::DropDown::new(Some(mode_list), None::<&gtk::Expression>);
     mode_dropdown.set_selected(0);
     add_row(&grid, 2, "Image mode", &mode_dropdown);
 
     let partition_list = gtk::StringList::new(&["GPT", "MBR"]);
     let partition_dropdown =
-        gtk::DropDown::new(Some(partition_list.clone()), None::<&gtk::Expression>);
+        gtk::DropDown::new(Some(partition_list), None::<&gtk::Expression>);
     partition_dropdown.set_selected(0);
     add_row(&grid, 3, "Partition scheme", &partition_dropdown);
 
     let target_list = gtk::StringList::new(&["UEFI", "BIOS", "UEFI + BIOS"]);
     let target_dropdown =
-        gtk::DropDown::new(Some(target_list.clone()), None::<&gtk::Expression>);
+        gtk::DropDown::new(Some(target_list), None::<&gtk::Expression>);
     target_dropdown.set_selected(0);
     add_row(&grid, 4, "Target system", &target_dropdown);
 
     let fs_list = gtk::StringList::new(&["FAT32", "NTFS", "exFAT"]);
-    let fs_dropdown = gtk::DropDown::new(Some(fs_list.clone()), None::<&gtk::Expression>);
+    let fs_dropdown = gtk::DropDown::new(Some(fs_list), None::<&gtk::Expression>);
     fs_dropdown.set_selected(0);
     add_row(&grid, 5, "File system", &fs_dropdown);
 
@@ -138,15 +143,89 @@ fn build_ui(app: &adw::Application) {
     window.present();
 
     let devices_state: Rc<RefCell<Vec<devices::Device>>> = Rc::new(RefCell::new(Vec::new()));
+    let flashing: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
-    refresh_devices(&device_list, &devices_state, &log_buffer);
+    refresh_devices_guarded(&device_list, &devices_state, &log_buffer, &flashing, false);
 
     let device_list_clone = device_list.clone();
     let devices_state_clone = devices_state.clone();
     let log_buffer_clone = log_buffer.clone();
+    let flashing_clone = flashing.clone();
     refresh_button.connect_clicked(move |_| {
-        refresh_devices(&device_list_clone, &devices_state_clone, &log_buffer_clone);
+        refresh_devices_guarded(
+            &device_list_clone,
+            &devices_state_clone,
+            &log_buffer_clone,
+            &flashing_clone,
+            true,
+        );
     });
+
+    let refresh_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let schedule_refresh: Rc<dyn Fn()> = {
+        let devices_state = devices_state.clone();
+        let log_buffer = log_buffer.clone();
+        let flashing = flashing.clone();
+        Rc::new(move || {
+            if let Some(id) = refresh_timer.borrow_mut().take() {
+                id.remove();
+            }
+            let device_list = device_list.clone();
+            let devices_state = devices_state.clone();
+            let log_buffer = log_buffer.clone();
+            let refresh_timer_for_cb = refresh_timer.clone();
+            let flashing = flashing.clone();
+            let id = glib::timeout_add_local_once(Duration::from_millis(400), move || {
+                refresh_devices_guarded(
+                    &device_list,
+                    &devices_state,
+                    &log_buffer,
+                    &flashing,
+                    false,
+                );
+                refresh_timer_for_cb.borrow_mut().take();
+            });
+            *refresh_timer.borrow_mut() = Some(id);
+        })
+    };
+
+    let monitor = gio::VolumeMonitor::get();
+    {
+        let schedule_refresh = schedule_refresh.clone();
+        monitor.connect_drive_connected(move |_, _| {
+            schedule_refresh();
+        });
+    }
+    {
+        let schedule_refresh = schedule_refresh.clone();
+        monitor.connect_drive_disconnected(move |_, _| {
+            schedule_refresh();
+        });
+    }
+    {
+        let schedule_refresh = schedule_refresh.clone();
+        monitor.connect_volume_added(move |_, _| {
+            schedule_refresh();
+        });
+    }
+    {
+        let schedule_refresh = schedule_refresh.clone();
+        monitor.connect_volume_removed(move |_, _| {
+            schedule_refresh();
+        });
+    }
+    {
+        let schedule_refresh = schedule_refresh.clone();
+        monitor.connect_mount_added(move |_, _| {
+            schedule_refresh();
+        });
+    }
+    {
+        let schedule_refresh = schedule_refresh.clone();
+        monitor.connect_mount_removed(move |_, _| {
+            schedule_refresh();
+        });
+    }
 
     let window_clone = window.clone();
     let iso_entry_clone = iso_entry.clone();
@@ -185,8 +264,8 @@ fn build_ui(app: &adw::Application) {
 
     let controls: Vec<gtk::Widget> = vec![
         device_dropdown.clone().upcast(),
-        refresh_button.clone().upcast(),
-        browse_button.clone().upcast(),
+        refresh_button.upcast(),
+        browse_button.upcast(),
         iso_entry.clone().upcast(),
         mode_dropdown.clone().upcast(),
         partition_dropdown.clone().upcast(),
@@ -200,6 +279,7 @@ fn build_ui(app: &adw::Application) {
     let progress_clone = progress.clone();
     let log_buffer_receiver = log_buffer.clone();
     let controls_receiver = controls.clone();
+    let flashing_receiver = flashing.clone();
 
     glib::idle_add_local(move || {
         loop {
@@ -215,6 +295,7 @@ fn build_ui(app: &adw::Application) {
                             Ok(()) => append_log(&log_buffer_receiver, "Completed successfully"),
                             Err(err) => append_log(&log_buffer_receiver, &format!("Error: {err}")),
                         }
+                        *flashing_receiver.borrow_mut() = false;
                         set_controls_sensitive(&controls_receiver, true);
                     }
                 },
@@ -227,8 +308,6 @@ fn build_ui(app: &adw::Application) {
         glib::ControlFlow::Continue
     });
 
-    let sender_clone = sender.clone();
-    let window_clone = window.clone();
     start_button.connect_clicked(move |_| {
         let iso_text = iso_entry.text().to_string();
         if iso_text.trim().is_empty() {
@@ -256,8 +335,9 @@ fn build_ui(app: &adw::Application) {
             append_log(
                 &log_buffer,
                 &format!(
-                    "Refusing to write: {} is mounted on {}",
-                    device.path, reason
+                    "Refusing to write: {device_path} is mounted on {reason}",
+                    device_path = &device.path,
+                    reason = reason
                 ),
             );
             return;
@@ -303,19 +383,23 @@ fn build_ui(app: &adw::Application) {
             secure_boot_only: secure_toggle.is_active(),
         };
 
-        let sender = sender_clone.clone();
+        let sender = sender.clone();
         let controls = controls.clone();
         let progress = progress.clone();
         let log_buffer = log_buffer.clone();
+        let flashing = flashing.clone();
 
         show_confirmation_dialog(
-            &window_clone,
+            &window,
             device,
             &mountpoints,
             move || {
                 append_log(
                     &log_buffer,
-                    &format!("Starting write to {}", plan.device_path),
+                    &format!(
+                        "Starting write to {device_path}",
+                        device_path = plan.device_path.as_str()
+                    ),
                 );
                 if !util::is_root() {
                     append_log(&log_buffer, "Requesting admin access (pkexec)...");
@@ -323,12 +407,13 @@ fn build_ui(app: &adw::Application) {
                 progress.set_fraction(0.0);
                 progress.set_text(Some("0%"));
                 set_controls_sensitive(&controls, false);
+                *flashing.borrow_mut() = true;
 
                 let sender = sender.clone();
                 std::thread::spawn(move || {
                     if util::is_root() {
                         let sender = sender.clone();
-                        writer::run(plan, move |event| {
+                        writer::run(&plan, move |event| {
                             let _ = sender.send(event);
                         });
                     } else {
@@ -364,6 +449,22 @@ fn set_controls_sensitive(controls: &[gtk::Widget], sensitive: bool) {
     for widget in controls {
         widget.set_sensitive(sensitive);
     }
+}
+
+fn refresh_devices_guarded(
+    device_list: &gtk::StringList,
+    devices_state: &Rc<RefCell<Vec<devices::Device>>>,
+    log_buffer: &gtk::TextBuffer,
+    flashing: &Rc<RefCell<bool>>,
+    log_when_skipped: bool,
+) {
+    if *flashing.borrow() {
+        if log_when_skipped {
+            append_log(log_buffer, "Flash in progress; device refresh skipped");
+        }
+        return;
+    }
+    refresh_devices(device_list, devices_state, log_buffer);
 }
 
 fn refresh_devices(
@@ -424,17 +525,17 @@ fn show_confirmation_dialog(
         .build();
 
     let warning = gtk::Label::new(Some(&format!(
-        "You are about to erase {}.\nThis action cannot be undone.",
-        device.display
+        "You are about to erase {device_display}.\nThis action cannot be undone.",
+        device_display = &device.display
     )));
     warning.set_wrap(true);
     warning.set_halign(gtk::Align::Start);
     container.append(&warning);
 
     if !mountpoints.is_empty() {
+        let mounts_text = mountpoints.join(", ");
         let mounts = gtk::Label::new(Some(&format!(
-            "Currently mounted: {}",
-            mountpoints.join(", ")
+            "Currently mounted: {mounts_text}"
         )));
         mounts.set_wrap(true);
         mounts.set_halign(gtk::Align::Start);
@@ -442,8 +543,8 @@ fn show_confirmation_dialog(
     }
 
     let prompt = gtk::Label::new(Some(&format!(
-        "Type {} to confirm:",
-        device.path
+        "Type {device_path} to confirm:",
+        device_path = &device.path
     )));
     prompt.set_halign(gtk::Align::Start);
     container.append(&prompt);
@@ -476,29 +577,28 @@ fn show_confirmation_dialog(
     dialog.set_child(Some(&container));
     dialog.present();
 
-    let dialog_clone = dialog.clone();
+    let dialog_for_cancel = dialog.clone();
     cancel_button.connect_clicked(move |_| {
-        dialog_clone.close();
+        dialog_for_cancel.close();
     });
 
     let on_confirm = Rc::new(RefCell::new(Some(on_confirm)));
-    let dialog_clone = dialog.clone();
-    let error_label_clone = error_label.clone();
+    let dialog_for_erase = dialog;
+    let error_label = error_label;
     let device_path = device.path.clone();
-    let on_confirm_clone = on_confirm.clone();
     erase_button.connect_clicked(move |_| {
         let typed = confirm_entry.text().to_string();
         if typed.trim() != device_path {
-            error_label_clone.set_text("Device path does not match.");
+            error_label.set_text("Device path does not match.");
             return;
         }
         if !confirm_check.is_active() {
-            error_label_clone.set_text("Please confirm the data loss checkbox.");
+            error_label.set_text("Please confirm the data loss checkbox.");
             return;
         }
 
-        dialog_clone.close();
-        if let Some(cb) = on_confirm_clone.borrow_mut().take() {
+        dialog_for_erase.close();
+        if let Some(cb) = on_confirm.borrow_mut().take() {
             cb();
         }
     });
