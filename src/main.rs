@@ -76,7 +76,7 @@ fn build_ui(app: &adw::Application) {
     let mode_list = gtk::StringList::new(&[
         "Auto (detect)",
         "ISOHybrid / DD",
-        "Windows (UEFI/FAT32)",
+        "Windows (UEFI/BIOS)",
     ]);
     let mode_dropdown = gtk::DropDown::new(Some(mode_list), None::<&gtk::Expression>);
     mode_dropdown.set_selected(0);
@@ -94,7 +94,7 @@ fn build_ui(app: &adw::Application) {
     target_dropdown.set_selected(0);
     add_row(&grid, 4, "Target system", &target_dropdown);
 
-    let fs_list = gtk::StringList::new(&["FAT32", "NTFS", "exFAT"]);
+    let fs_list = gtk::StringList::new(&["FAT32", "NTFS"]);
     let fs_dropdown = gtk::DropDown::new(Some(fs_list), None::<&gtk::Expression>);
     fs_dropdown.set_selected(0);
     add_row(&grid, 5, "File system", &fs_dropdown);
@@ -112,6 +112,60 @@ fn build_ui(app: &adw::Application) {
     secure_row.append(&secure_toggle);
     secure_row.append(&secure_desc);
     add_row(&grid, 7, "Secure Boot", &secure_row);
+
+    let checksum_entry = gtk::Entry::builder()
+        .placeholder_text("SHA256 hash or .sha256 file path")
+        .hexpand(true)
+        .build();
+    let checksum_button = gtk::Button::with_label("Select");
+    let checksum_row = gtk::Box::builder().spacing(8).hexpand(true).build();
+    checksum_row.append(&checksum_entry);
+    checksum_row.append(&checksum_button);
+    add_row(&grid, 8, "Checksum", &checksum_row);
+
+    let signature_entry = gtk::Entry::builder()
+        .placeholder_text("Signature file (.sig)")
+        .hexpand(true)
+        .build();
+    let signature_button = gtk::Button::with_label("Select");
+    let signature_row = gtk::Box::builder().spacing(8).hexpand(true).build();
+    signature_row.append(&signature_entry);
+    signature_row.append(&signature_button);
+    add_row(&grid, 9, "Signature", &signature_row);
+
+    let verify_toggle = gtk::Switch::builder().active(false).build();
+    let verify_desc = gtk::Label::new(Some("Verify files/device after write"));
+    verify_desc.set_halign(gtk::Align::Start);
+    let verify_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    verify_row.append(&verify_toggle);
+    verify_row.append(&verify_desc);
+    add_row(&grid, 10, "Verify", &verify_row);
+
+    let persistence_spin = gtk::SpinButton::with_range(0.0, 1048576.0, 64.0);
+    persistence_spin.set_value(0.0);
+    let persistence_label_entry = gtk::Entry::builder()
+        .text("persistence")
+        .placeholder_text("Label (e.g. persistence or casper-rw)")
+        .hexpand(true)
+        .build();
+    let persistence_row = gtk::Box::builder().spacing(8).hexpand(true).build();
+    persistence_row.append(&persistence_spin);
+    persistence_row.append(&persistence_label_entry);
+    add_row(&grid, 11, "Persistence (MiB)", &persistence_row);
+
+    let dry_run_toggle = gtk::Switch::builder().active(false).build();
+    let dry_run_desc = gtk::Label::new(Some("Dry run (no writes)"));
+    dry_run_desc.set_halign(gtk::Align::Start);
+    let dry_run_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    dry_run_row.append(&dry_run_toggle);
+    dry_run_row.append(&dry_run_desc);
+    add_row(&grid, 12, "Dry run", &dry_run_row);
 
     root.append(&grid);
 
@@ -145,18 +199,95 @@ fn build_ui(app: &adw::Application) {
     let devices_state: Rc<RefCell<Vec<devices::Device>>> = Rc::new(RefCell::new(Vec::new()));
     let flashing: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
-    refresh_devices_guarded(&device_list, &devices_state, &log_buffer, &flashing, false);
+    let update_controls: Rc<dyn Fn()> = {
+        let mode_dropdown = mode_dropdown.clone();
+        let partition_dropdown = partition_dropdown.clone();
+        let target_dropdown = target_dropdown.clone();
+        let fs_dropdown = fs_dropdown.clone();
+        let volume_entry = volume_entry.clone();
+        let secure_toggle = secure_toggle.clone();
+        let persistence_spin = persistence_spin.clone();
+        let persistence_label_entry = persistence_label_entry.clone();
+        Rc::new(move || {
+            let mode = mode_dropdown.selected();
+            let dd_mode = mode == 1;
+            let target = target_dropdown.selected();
+            let fs_idx = fs_dropdown.selected();
+            let uefi_enabled = target != 1;
+            let bios_enabled = target != 0;
+            let ntfs_selected = fs_idx == 1;
+
+            if dd_mode {
+                partition_dropdown.set_sensitive(false);
+                target_dropdown.set_sensitive(false);
+                fs_dropdown.set_sensitive(false);
+                volume_entry.set_sensitive(false);
+                secure_toggle.set_sensitive(false);
+                secure_toggle.set_active(false);
+                persistence_spin.set_sensitive(true);
+                persistence_label_entry.set_sensitive(true);
+                return;
+            }
+
+            target_dropdown.set_sensitive(true);
+            fs_dropdown.set_sensitive(true);
+            volume_entry.set_sensitive(true);
+            persistence_spin.set_sensitive(false);
+            persistence_label_entry.set_sensitive(false);
+
+            if bios_enabled {
+                if partition_dropdown.selected() != 1 {
+                    partition_dropdown.set_selected(1);
+                }
+                partition_dropdown.set_sensitive(false);
+            } else {
+                partition_dropdown.set_sensitive(true);
+            }
+
+            let secure_allowed = ntfs_selected && uefi_enabled;
+            if !secure_allowed {
+                secure_toggle.set_active(false);
+            }
+            secure_toggle.set_sensitive(secure_allowed);
+        })
+    };
+
+    update_controls();
+
+    let update_controls_clone = update_controls.clone();
+    mode_dropdown.connect_selected_notify(move |_| {
+        update_controls_clone();
+    });
+    let update_controls_clone = update_controls.clone();
+    target_dropdown.connect_selected_notify(move |_| {
+        update_controls_clone();
+    });
+    let update_controls_clone = update_controls.clone();
+    fs_dropdown.connect_selected_notify(move |_| {
+        update_controls_clone();
+    });
+
+    refresh_devices_guarded(
+        &device_list,
+        &devices_state,
+        &log_buffer,
+        &flashing,
+        &device_dropdown,
+        false,
+    );
 
     let device_list_clone = device_list.clone();
     let devices_state_clone = devices_state.clone();
     let log_buffer_clone = log_buffer.clone();
     let flashing_clone = flashing.clone();
+    let device_dropdown_clone = device_dropdown.clone();
     refresh_button.connect_clicked(move |_| {
         refresh_devices_guarded(
             &device_list_clone,
             &devices_state_clone,
             &log_buffer_clone,
             &flashing_clone,
+            &device_dropdown_clone,
             true,
         );
     });
@@ -166,6 +297,7 @@ fn build_ui(app: &adw::Application) {
         let devices_state = devices_state.clone();
         let log_buffer = log_buffer.clone();
         let flashing = flashing.clone();
+        let device_dropdown = device_dropdown.clone();
         Rc::new(move || {
             if let Some(id) = refresh_timer.borrow_mut().take() {
                 id.remove();
@@ -175,12 +307,14 @@ fn build_ui(app: &adw::Application) {
             let log_buffer = log_buffer.clone();
             let refresh_timer_for_cb = refresh_timer.clone();
             let flashing = flashing.clone();
+            let device_dropdown = device_dropdown.clone();
             let id = glib::timeout_add_local_once(Duration::from_millis(400), move || {
                 refresh_devices_guarded(
                     &device_list,
                     &devices_state,
                     &log_buffer,
                     &flashing,
+                    &device_dropdown,
                     false,
                 );
                 refresh_timer_for_cb.borrow_mut().take();
@@ -260,6 +394,40 @@ fn build_ui(app: &adw::Application) {
         });
     });
 
+    let window_clone = window.clone();
+    let checksum_entry_clone = checksum_entry.clone();
+    checksum_button.connect_clicked(move |_| {
+        let dialog = gtk::FileDialog::builder()
+            .title("Select checksum file")
+            .modal(true)
+            .build();
+        let entry = checksum_entry_clone.clone();
+        dialog.open(Some(&window_clone), None::<&gio::Cancellable>, move |result| {
+            if let Ok(file) = result
+                && let Some(path) = file.path()
+            {
+                entry.set_text(path.to_string_lossy().as_ref());
+            }
+        });
+    });
+
+    let window_clone = window.clone();
+    let signature_entry_clone = signature_entry.clone();
+    signature_button.connect_clicked(move |_| {
+        let dialog = gtk::FileDialog::builder()
+            .title("Select signature file")
+            .modal(true)
+            .build();
+        let entry = signature_entry_clone.clone();
+        dialog.open(Some(&window_clone), None::<&gio::Cancellable>, move |result| {
+            if let Ok(file) = result
+                && let Some(path) = file.path()
+            {
+                entry.set_text(path.to_string_lossy().as_ref());
+            }
+        });
+    });
+
     let (sender, receiver) = mpsc::channel::<UiEvent>();
 
     let controls: Vec<gtk::Widget> = vec![
@@ -273,6 +441,14 @@ fn build_ui(app: &adw::Application) {
         fs_dropdown.clone().upcast(),
         volume_entry.clone().upcast(),
         secure_toggle.clone().upcast(),
+        checksum_entry.clone().upcast(),
+        checksum_button.upcast(),
+        signature_entry.clone().upcast(),
+        signature_button.upcast(),
+        verify_toggle.clone().upcast(),
+        persistence_spin.clone().upcast(),
+        persistence_label_entry.clone().upcast(),
+        dry_run_toggle.clone().upcast(),
         start_button.clone().upcast(),
     ];
 
@@ -280,6 +456,7 @@ fn build_ui(app: &adw::Application) {
     let log_buffer_receiver = log_buffer.clone();
     let controls_receiver = controls.clone();
     let flashing_receiver = flashing.clone();
+    let update_controls_receiver = update_controls.clone();
 
     glib::idle_add_local(move || {
         loop {
@@ -297,6 +474,7 @@ fn build_ui(app: &adw::Application) {
                         }
                         *flashing_receiver.borrow_mut() = false;
                         set_controls_sensitive(&controls_receiver, true);
+                        update_controls_receiver();
                     }
                 },
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -365,11 +543,30 @@ fn build_ui(app: &adw::Application) {
             _ => TargetSystem::UefiAndBios,
         };
 
-        let file_system = match fs_dropdown.selected() {
-            0 => FileSystem::Fat32,
-            1 => FileSystem::Ntfs,
-            _ => FileSystem::Exfat,
+        let file_system = if fs_dropdown.selected() == 1 {
+            FileSystem::Ntfs
+        } else {
+            FileSystem::Fat32
         };
+
+        let checksum_value = {
+            let text = checksum_entry.text().trim().to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        };
+        let signature_path = {
+            let text = signature_entry.text().trim().to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(text))
+            }
+        };
+        let persistence_size_mib = persistence_spin.value() as u64;
+        let persistence_label = persistence_label_entry.text().to_string();
 
         let plan = WritePlan {
             iso_path,
@@ -381,6 +578,12 @@ fn build_ui(app: &adw::Application) {
             file_system,
             volume_label: volume_entry.text().to_string(),
             secure_boot_only: secure_toggle.is_active(),
+            verify_after: verify_toggle.is_active(),
+            checksum_sha256: checksum_value,
+            signature_path,
+            persistence_size_mib,
+            persistence_label,
+            dry_run: dry_run_toggle.is_active(),
         };
 
         let sender = sender.clone();
@@ -456,6 +659,7 @@ fn refresh_devices_guarded(
     devices_state: &Rc<RefCell<Vec<devices::Device>>>,
     log_buffer: &gtk::TextBuffer,
     flashing: &Rc<RefCell<bool>>,
+    device_dropdown: &gtk::DropDown,
     log_when_skipped: bool,
 ) {
     if *flashing.borrow() {
@@ -464,14 +668,21 @@ fn refresh_devices_guarded(
         }
         return;
     }
-    refresh_devices(device_list, devices_state, log_buffer);
+    refresh_devices(device_list, devices_state, log_buffer, device_dropdown);
 }
 
 fn refresh_devices(
     device_list: &gtk::StringList,
     devices_state: &Rc<RefCell<Vec<devices::Device>>>,
     log_buffer: &gtk::TextBuffer,
+    device_dropdown: &gtk::DropDown,
 ) {
+    let previous_path = {
+        let devices = devices_state.borrow();
+        let selected = device_dropdown.selected() as usize;
+        devices.get(selected).map(|dev| dev.path.clone())
+    };
+
     match devices::list_removable() {
         Ok(list) => {
             devices_state.borrow_mut().clear();
@@ -482,6 +693,15 @@ fn refresh_devices(
             }
             for dev in devices_state.borrow().iter() {
                 device_list.append(&dev.display);
+            }
+            if let Some(path) = previous_path {
+                if let Some(idx) = devices_state.borrow().iter().position(|dev| dev.path == path) {
+                    device_dropdown.set_selected(idx as u32);
+                } else {
+                    device_dropdown.set_selected(gtk::INVALID_LIST_POSITION);
+                }
+            } else if device_list.n_items() == 0 {
+                device_dropdown.set_selected(gtk::INVALID_LIST_POSITION);
             }
             append_log(log_buffer, "Device list refreshed");
         }

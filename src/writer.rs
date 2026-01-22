@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -57,6 +58,12 @@ pub struct WritePlan {
     pub file_system: FileSystem,
     pub volume_label: String,
     pub secure_boot_only: bool,
+    pub verify_after: bool,
+    pub checksum_sha256: Option<String>,
+    pub signature_path: Option<PathBuf>,
+    pub persistence_size_mib: u64,
+    pub persistence_label: String,
+    pub dry_run: bool,
 }
 
 #[derive(Debug)]
@@ -75,6 +82,11 @@ where
         if !plan.iso_path.exists() {
             bail!("Image path does not exist");
         }
+        verify_iso(plan, &mut emit)?;
+
+        if plan.dry_run {
+            log(&mut emit, "Dry run enabled (no writes will be performed)".to_string());
+        }
 
         let mode = match plan.image_mode {
             ImageMode::Auto => detect_image_mode(&plan.iso_path, &mut emit),
@@ -83,7 +95,7 @@ where
 
         match mode {
             ImageMode::IsoHybridDd => write_dd(plan, &mut emit),
-            ImageMode::WindowsUefi => write_windows_uefi(plan, &mut emit),
+            ImageMode::WindowsUefi => write_windows(plan, &mut emit),
             ImageMode::Auto => unreachable!(),
         }
     })();
@@ -132,6 +144,90 @@ fn iso_listing(path: &Path) -> Option<String> {
     None
 }
 
+fn verify_iso(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    if let Some(checksum) = plan.checksum_sha256.as_deref() {
+        let expected = resolve_checksum(checksum)?;
+        log(emit, "Verifying SHA256 checksum".to_string());
+        let actual = sha256_file(&plan.iso_path)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            bail!("Checksum mismatch (expected {expected}, got {actual})");
+        }
+        log(emit, "Checksum verified".to_string());
+    }
+
+    if let Some(signature) = plan.signature_path.as_ref() {
+        verify_signature(&plan.iso_path, signature, emit)?;
+    }
+
+    Ok(())
+}
+
+fn resolve_checksum(input: &str) -> Result<String> {
+    let candidate = input.trim();
+    if candidate.is_empty() {
+        bail!("Checksum is empty");
+    }
+    if Path::new(candidate).exists() {
+        let data =
+            fs::read_to_string(candidate).with_context(|| format!("reading checksum {candidate}"))?;
+        parse_checksum_text(&data)
+    } else {
+        parse_checksum_text(candidate)
+    }
+}
+
+fn parse_checksum_text(text: &str) -> Result<String> {
+    for token in text.split_whitespace() {
+        if is_sha256_hex(token) {
+            return Ok(token.to_lowercase());
+        }
+    }
+    bail!("No valid SHA256 checksum found");
+}
+
+fn is_sha256_hex(token: &str) -> bool {
+    token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("opening {path}", path = path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).context("reading file")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(format!("{:x}", digest))
+}
+
+fn verify_signature(
+    iso_path: &Path,
+    signature_path: &Path,
+    emit: &mut dyn FnMut(UiEvent),
+) -> Result<()> {
+    if !command_exists("gpg") {
+        bail!("gpg not found; cannot verify signature");
+    }
+    log(emit, "Verifying signature".to_string());
+    let output = Command::new("gpg")
+        .arg("--verify")
+        .arg(signature_path)
+        .arg(iso_path)
+        .output()
+        .with_context(|| format!("running gpg on {sig}", sig = signature_path.display()))?;
+    if output.status.success() {
+        log(emit, "Signature verified".to_string());
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow!("Signature verification failed: {stderr}"))
+    }
+}
+
 fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     log(emit, "Preparing device (unmounting)".to_string());
     unmount_device(&plan.device_path, emit)?;
@@ -141,6 +237,14 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
         && iso_size > device_size
     {
         bail!("ISO is larger than the selected device");
+    }
+
+    if plan.dry_run {
+        log(emit, "Dry run: would write ISO in DD mode".to_string());
+        if plan.persistence_size_mib > 0 {
+            validate_persistence(plan, emit)?;
+        }
+        return Ok(());
     }
 
     log(emit, "Writing ISO (DD mode)".to_string());
@@ -177,24 +281,62 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     log(emit, "Syncing buffers".to_string());
     let _ = Command::new("sync").status();
 
+    if plan.verify_after {
+        log(emit, "Verifying written data".to_string());
+        verify_dd_write(plan, emit)?;
+    }
+
+    if plan.persistence_size_mib > 0 {
+        log(emit, "Creating persistence partition".to_string());
+        apply_persistence(plan, emit)?;
+    }
+
     log(emit, "DD write completed".to_string());
     Ok(())
 }
 
-fn write_windows_uefi(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
-    if matches!(plan.target_system, TargetSystem::Bios | TargetSystem::UefiAndBios) {
-        bail!("Windows BIOS/UEFI+BIOS boot is not implemented yet");
-    }
-
-    match plan.file_system {
-        FileSystem::Fat32 => write_windows_uefi_fat32(plan, emit),
-        FileSystem::Ntfs => write_windows_uefi_ntfs(plan, emit),
-        FileSystem::Exfat => bail!("Windows mode does not support exFAT"),
+fn write_windows(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    match plan.target_system {
+        TargetSystem::Uefi => write_windows_uefi(plan, emit),
+        TargetSystem::Bios => write_windows_bios(plan, emit),
+        TargetSystem::UefiAndBios => write_windows_uefi_bios(plan, emit),
     }
 }
 
-fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
-    for cmd in ["parted", "mkfs.vfat", "mount", "umount", "rsync"] {
+fn write_windows_uefi(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    match plan.file_system {
+        FileSystem::Fat32 => write_windows_fat32(plan, emit, false),
+        FileSystem::Ntfs => write_windows_ntfs_uefi(plan, emit),
+        FileSystem::Exfat => bail!("Windows UEFI mode does not support exFAT"),
+    }
+}
+
+fn write_windows_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    match plan.file_system {
+        FileSystem::Fat32 => write_windows_fat32(plan, emit, true),
+        FileSystem::Ntfs => write_windows_ntfs_bios(plan, emit),
+        FileSystem::Exfat => bail!("Windows BIOS mode does not support exFAT"),
+    }
+}
+
+fn write_windows_uefi_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    match plan.file_system {
+        FileSystem::Fat32 => write_windows_fat32(plan, emit, true),
+        FileSystem::Ntfs => write_windows_ntfs_uefi_bios(plan, emit),
+        FileSystem::Exfat => bail!("Windows UEFI+BIOS mode does not support exFAT"),
+    }
+}
+
+fn write_windows_fat32(
+    plan: &WritePlan,
+    emit: &mut dyn FnMut(UiEvent),
+    install_bios: bool,
+) -> Result<()> {
+    let mut required = vec!["parted", "mkfs.vfat", "mount", "umount", "rsync"];
+    if install_bios {
+        required.push("grub-install");
+    }
+    for cmd in required {
         if !command_exists(cmd) {
             bail!("Required tool not found: {cmd}");
         }
@@ -203,8 +345,31 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
     log(emit, "Preparing device (unmounting)".to_string());
     unmount_device(&plan.device_path, emit)?;
 
+    let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
+    if let Some(device_size) = plan.device_size_bytes
+        && iso_size > device_size
+    {
+        bail!("ISO is larger than the selected device");
+    }
+
+    if plan.dry_run {
+        log(emit, "Dry run: would format and copy Windows files (FAT32)".to_string());
+        return Ok(());
+    }
+
     log(emit, "Partitioning device".to_string());
-    create_partition(&plan.device_path, plan.partition_scheme, emit)?;
+    let scheme = if install_bios {
+        if plan.partition_scheme != PartitionScheme::Mbr {
+            log(
+                emit,
+                "BIOS support requires MBR; switching partition scheme to MBR".to_string(),
+            );
+        }
+        PartitionScheme::Mbr
+    } else {
+        plan.partition_scheme
+    };
+    create_partition(&plan.device_path, scheme, emit)?;
 
     let partition = partition_path(&plan.device_path);
     let label = sanitize_fat_label(&plan.volume_label);
@@ -246,19 +411,10 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
     let copy_result = (|| -> Result<()> {
         log(emit, "Copying files".to_string());
         let rsync_args = vec![
-            "-aH".to_string(),
             "--exclude=/sources/install.wim".to_string(),
             "--exclude=/sources/install.esd".to_string(),
-            format!(
-                "{path}/",
-                path = iso_dir.path().to_string_lossy()
-            ),
-            format!(
-                "{path}/",
-                path = usb_dir.path().to_string_lossy()
-            ),
         ];
-        run_cmd(emit, "rsync", &rsync_args, "rsync")?;
+        run_rsync_with_progress(emit, iso_dir.path(), usb_dir.path(), &rsync_args)?;
 
         let wim_path = iso_dir.path().join("sources/install.wim");
         let esd_path = iso_dir.path().join("sources/install.esd");
@@ -269,6 +425,19 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
             handle_wim(&esd_path, usb_dir.path(), emit)?;
         } else {
             log(emit, "No install.wim/esd found; ISO may be non-Windows".to_string());
+        }
+
+        if install_bios {
+            install_bios_grub(&plan.device_path, usb_dir.path(), FileSystem::Fat32, emit)?;
+        }
+
+        if plan.verify_after {
+            let verify_args = vec![
+                "--exclude=/sources/install.wim".to_string(),
+                "--exclude=/sources/install.esd".to_string(),
+            ];
+            verify_tree_with_rsync(emit, iso_dir.path(), usb_dir.path(), &verify_args)?;
+            verify_windows_install_media(iso_dir.path(), usb_dir.path(), emit)?;
         }
 
         Ok(())
@@ -285,16 +454,141 @@ fn write_windows_uefi_fat32(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> 
     log(emit, "Syncing buffers".to_string());
     let _ = Command::new("sync").status();
     emit(UiEvent::Progress(1.0));
-    log(emit, "Windows UEFI write completed".to_string());
+    log(emit, "Windows FAT32 write completed".to_string());
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
-    if plan.partition_scheme != PartitionScheme::Gpt {
-        bail!("UEFI:NTFS requires GPT partition scheme");
+fn write_windows_ntfs_uefi(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    let scheme = plan.partition_scheme;
+    if scheme == PartitionScheme::Mbr {
+        log(
+            emit,
+            "UEFI:NTFS on MBR is enabled (some firmware may prefer GPT)".to_string(),
+        );
+    }
+    write_windows_ntfs_with_esp(plan, emit, scheme, false)
+}
+
+fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    for cmd in ["parted", "mount", "umount", "rsync", "grub-install"] {
+        if !command_exists(cmd) {
+            bail!("Required tool not found: {cmd}");
+        }
     }
 
+    let mkfs_ntfs = if command_exists("mkfs.ntfs") {
+        "mkfs.ntfs"
+    } else if command_exists("mkfs.ntfs3") {
+        "mkfs.ntfs3"
+    } else {
+        bail!("Required tool not found: mkfs.ntfs or mkfs.ntfs3");
+    };
+
+    let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
+    if let Some(device_size) = plan.device_size_bytes
+        && iso_size > device_size
+    {
+        bail!("ISO is larger than the selected device");
+    }
+
+    if plan.dry_run {
+        log(emit, "Dry run: would format and copy Windows files (NTFS BIOS)".to_string());
+        return Ok(());
+    }
+
+    log(emit, "Preparing device (unmounting)".to_string());
+    unmount_device(&plan.device_path, emit)?;
+
+    log(emit, "Partitioning device (NTFS)".to_string());
+    let scheme = if plan.partition_scheme != PartitionScheme::Mbr {
+        log(
+            emit,
+            "BIOS support requires MBR; switching partition scheme to MBR".to_string(),
+        );
+        PartitionScheme::Mbr
+    } else {
+        plan.partition_scheme
+    };
+    create_ntfs_partition(&plan.device_path, scheme, emit)?;
+
+    let partition = partition_path(&plan.device_path);
+    log(emit, "Waiting for partition device".to_string());
+    wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
+
+    let ntfs_label = sanitize_ntfs_label(&plan.volume_label);
+    log(emit, "Formatting NTFS".to_string());
+    let mkfs_ntfs_args = vec![
+        "-F".to_string(),
+        "-L".to_string(),
+        ntfs_label,
+        partition.clone(),
+    ];
+    run_cmd(emit, mkfs_ntfs, &mkfs_ntfs_args, "mkfs.ntfs")?;
+
+    let iso_dir = tempfile::tempdir().context("creating temp dir for ISO")?;
+    let usb_dir = tempfile::tempdir().context("creating temp dir for NTFS")?;
+
+    log(emit, "Mounting ISO".to_string());
+    let mount_iso_args = vec![
+        "-o".to_string(),
+        "loop,ro".to_string(),
+        plan.iso_path.to_string_lossy().to_string(),
+        iso_dir.path().to_string_lossy().to_string(),
+    ];
+    run_cmd(emit, "mount", &mount_iso_args, "mount ISO")?;
+
+    log(emit, "Mounting NTFS".to_string());
+    let mount_usb_args = vec![partition, usb_dir.path().to_string_lossy().to_string()];
+    if let Err(err) = run_cmd(emit, "mount", &mount_usb_args, "mount NTFS") {
+        let _ = Command::new("umount").arg(iso_dir.path()).status();
+        return Err(err);
+    }
+
+    let copy_result = (|| -> Result<()> {
+        log(emit, "Copying files to NTFS".to_string());
+        let rsync_args = Vec::new();
+        run_rsync_with_progress(emit, iso_dir.path(), usb_dir.path(), &rsync_args)?;
+        install_bios_grub(&plan.device_path, usb_dir.path(), FileSystem::Ntfs, emit)?;
+        if plan.verify_after {
+            verify_tree_with_rsync(emit, iso_dir.path(), usb_dir.path(), &rsync_args)?;
+        }
+        Ok(())
+    })();
+
+    log(emit, "Unmounting NTFS".to_string());
+    let _ = Command::new("umount").arg(usb_dir.path()).status();
+    log(emit, "Unmounting ISO".to_string());
+    let _ = Command::new("umount").arg(iso_dir.path()).status();
+
+    copy_result?;
+
+    log(emit, "Syncing buffers".to_string());
+    let _ = Command::new("sync").status();
+    emit(UiEvent::Progress(1.0));
+    log(emit, "Windows BIOS NTFS write completed".to_string());
+    Ok(())
+}
+
+fn write_windows_ntfs_uefi_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    let scheme = if plan.partition_scheme != PartitionScheme::Mbr {
+        log(
+            emit,
+            "UEFI+BIOS with NTFS requires MBR; switching partition scheme to MBR".to_string(),
+        );
+        PartitionScheme::Mbr
+    } else {
+        plan.partition_scheme
+    };
+    write_windows_ntfs_with_esp(plan, emit, scheme, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_windows_ntfs_with_esp(
+    plan: &WritePlan,
+    emit: &mut dyn FnMut(UiEvent),
+    scheme: PartitionScheme,
+    install_bios: bool,
+) -> Result<()> {
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
     if let Some(device_size) = plan.device_size_bytes {
         let overhead = 260 * 1024 * 1024u64;
@@ -303,7 +597,11 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
         }
     }
 
-    for cmd in ["parted", "mkfs.vfat", "mount", "umount", "rsync"] {
+    let mut required = vec!["parted", "mkfs.vfat", "mount", "umount", "rsync"];
+    if install_bios {
+        required.push("grub-install");
+    }
+    for cmd in required {
         if !command_exists(cmd) {
             bail!("Required tool not found: {cmd}");
         }
@@ -325,11 +623,19 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
         bail!("Required tool not found: mkfs.ntfs or mkfs.ntfs3");
     };
 
+    if plan.dry_run {
+        log(
+            emit,
+            "Dry run: would format ESP+NTFS and copy Windows files".to_string(),
+        );
+        return Ok(());
+    }
+
     log(emit, "Preparing device (unmounting)".to_string());
     unmount_device(&plan.device_path, emit)?;
 
     log(emit, "Partitioning device (ESP + NTFS)".to_string());
-    create_windows_partitions_ntfs(&plan.device_path, emit)?;
+    create_windows_partitions_ntfs(&plan.device_path, scheme, emit)?;
 
     let esp_partition = partition_path_for(&plan.device_path, 1);
     let data_partition = partition_path_for(&plan.device_path, 2);
@@ -395,7 +701,8 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
 
     let copy_result = (|| -> Result<()> {
         log(emit, "Copying files to NTFS".to_string());
-        run_rsync_with_progress(emit, iso_dir.path(), data_dir.path())?;
+        let rsync_args = Vec::new();
+        run_rsync_with_progress(emit, iso_dir.path(), data_dir.path(), &rsync_args)?;
 
         log(emit, "Installing UEFI:NTFS bootloader".to_string());
         let secure = install_uefi_ntfs_loaders(
@@ -413,6 +720,15 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
                     .to_string(),
             );
         }
+
+        if install_bios {
+            install_bios_grub(&plan.device_path, data_dir.path(), FileSystem::Ntfs, emit)?;
+        }
+
+        if plan.verify_after {
+            verify_tree_with_rsync(emit, iso_dir.path(), data_dir.path(), &rsync_args)?;
+        }
+
         Ok(())
     })();
 
@@ -428,7 +744,7 @@ fn write_windows_uefi_ntfs(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     log(emit, "Syncing buffers".to_string());
     let _ = Command::new("sync").status();
     emit(UiEvent::Progress(1.0));
-    log(emit, "Windows UEFI NTFS write completed".to_string());
+    log(emit, "Windows NTFS write completed".to_string());
     Ok(())
 }
 
@@ -535,8 +851,64 @@ fn create_partition(
     Ok(())
 }
 
-fn create_windows_partitions_ntfs(device: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
-    let args = vec!["-s".to_string(), device.to_string(), "mklabel".to_string(), "gpt".to_string()];
+fn create_ntfs_partition(
+    device: &str,
+    scheme: PartitionScheme,
+    emit: &mut dyn FnMut(UiEvent),
+) -> Result<()> {
+    if scheme != PartitionScheme::Mbr {
+        bail!("NTFS BIOS mode requires MBR partition scheme");
+    }
+
+    let args = vec![
+        "-s".to_string(),
+        device.to_string(),
+        "mklabel".to_string(),
+        "msdos".to_string(),
+    ];
+    run_cmd(emit, "parted", &args, "parted mklabel")?;
+
+    let mkpart_args = vec![
+        "-s".to_string(),
+        device.to_string(),
+        "mkpart".to_string(),
+        "primary".to_string(),
+        "ntfs".to_string(),
+        "1MiB".to_string(),
+        "100%".to_string(),
+    ];
+    run_cmd(emit, "parted", &mkpart_args, "parted mkpart")?;
+
+    let set_args = vec![
+        "-s".to_string(),
+        device.to_string(),
+        "set".to_string(),
+        "1".to_string(),
+        "boot".to_string(),
+        "on".to_string(),
+    ];
+    run_cmd(emit, "parted", &set_args, "parted set boot")?;
+
+    refresh_partition_table(device);
+
+    Ok(())
+}
+
+fn create_windows_partitions_ntfs(
+    device: &str,
+    scheme: PartitionScheme,
+    emit: &mut dyn FnMut(UiEvent),
+) -> Result<()> {
+    let label = match scheme {
+        PartitionScheme::Gpt => "gpt",
+        PartitionScheme::Mbr => "msdos",
+    };
+    let args = vec![
+        "-s".to_string(),
+        device.to_string(),
+        "mklabel".to_string(),
+        label.to_string(),
+    ];
     run_cmd(emit, "parted", &args, "parted mklabel")?;
 
     let mkpart_esp = vec![
@@ -550,15 +922,19 @@ fn create_windows_partitions_ntfs(device: &str, emit: &mut dyn FnMut(UiEvent)) -
     ];
     run_cmd(emit, "parted", &mkpart_esp, "parted mkpart ESP")?;
 
+    let flag = match scheme {
+        PartitionScheme::Gpt => "esp",
+        PartitionScheme::Mbr => "boot",
+    };
     let set_esp = vec![
         "-s".to_string(),
         device.to_string(),
         "set".to_string(),
         "1".to_string(),
-        "esp".to_string(),
+        flag.to_string(),
         "on".to_string(),
     ];
-    run_cmd(emit, "parted", &set_esp, "parted set esp")?;
+    run_cmd(emit, "parted", &set_esp, "parted set flag")?;
 
     let mkpart_ntfs = vec![
         "-s".to_string(),
@@ -573,6 +949,237 @@ fn create_windows_partitions_ntfs(device: &str, emit: &mut dyn FnMut(UiEvent)) -
 
     refresh_partition_table(device);
 
+    Ok(())
+}
+
+struct PartedInfo {
+    device_size_mib: f64,
+    last_end_mib: f64,
+    last_partition: u32,
+}
+
+fn validate_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    if plan.persistence_size_mib == 0 {
+        return Ok(());
+    }
+    for cmd in ["parted", "mkfs.ext4"] {
+        if !command_exists(cmd) {
+            bail!("Persistence requires {cmd}");
+        }
+    }
+    let info = parted_info(&plan.device_path, plan.device_size_bytes, emit)?;
+    let (_index, _start, end) = persistence_bounds(&info, plan.persistence_size_mib)?;
+    if end > info.device_size_mib {
+        bail!("Not enough free space for persistence");
+    }
+    Ok(())
+}
+
+fn apply_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    if plan.persistence_size_mib == 0 {
+        return Ok(());
+    }
+    for cmd in ["parted", "mkfs.ext4"] {
+        if !command_exists(cmd) {
+            bail!("Persistence requires {cmd}");
+        }
+    }
+
+    let info = parted_info(&plan.device_path, plan.device_size_bytes, emit)?;
+    let (index, start, end) = persistence_bounds(&info, plan.persistence_size_mib)?;
+    let start_arg = format!("{start}MiB");
+    let end_arg = format!("{end}MiB");
+    let mkpart_args = vec![
+        "-s".to_string(),
+        plan.device_path.clone(),
+        "mkpart".to_string(),
+        "primary".to_string(),
+        "ext4".to_string(),
+        start_arg,
+        end_arg,
+    ];
+    run_cmd(emit, "parted", &mkpart_args, "parted mkpart persistence")?;
+    refresh_partition_table(&plan.device_path);
+
+    let partition = partition_path_for(&plan.device_path, index);
+    log(
+        emit,
+        format!("Waiting for persistence device node {partition}"),
+    );
+    wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
+
+    let label = sanitize_ext4_label(&plan.persistence_label);
+    let mkfs_args = vec![
+        "-F".to_string(),
+        "-L".to_string(),
+        label.clone(),
+        partition.clone(),
+    ];
+    run_cmd(emit, "mkfs.ext4", &mkfs_args, "mkfs.ext4")?;
+
+    if label == "persistence" {
+        create_persistence_conf(&partition, emit)?;
+    }
+
+    Ok(())
+}
+
+fn persistence_bounds(info: &PartedInfo, size_mib: u64) -> Result<(u32, f64, f64)> {
+    if size_mib == 0 {
+        bail!("Persistence size must be greater than 0");
+    }
+    let start = (info.last_end_mib + 1.0).ceil();
+    let end = start + size_mib as f64;
+    let max_end = info.device_size_mib - 4.0;
+    if end > max_end {
+        bail!("Not enough free space for persistence");
+    }
+    Ok((info.last_partition + 1, start, end))
+}
+
+fn parted_info(
+    device: &str,
+    device_size_bytes: Option<u64>,
+    emit: &mut dyn FnMut(UiEvent),
+) -> Result<PartedInfo> {
+    let output = Command::new("parted")
+        .args(["-ms", device, "unit", "MiB", "print"])
+        .output()
+        .with_context(|| format!("running parted on {device}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("parted failed: {stderr}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut device_size_mib = None;
+    let mut last_end = 1.0;
+    let mut last_partition = 0u32;
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line.starts_with("BYT;") {
+            continue;
+        }
+        if line.starts_with(device) {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() > 1 {
+                device_size_mib = parse_mib(parts[1]);
+            }
+            continue;
+        }
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let Ok(num) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        if let Some(end) = parse_mib(parts[2]) {
+            if end > last_end {
+                last_end = end;
+            }
+        }
+        if num > last_partition {
+            last_partition = num;
+        }
+    }
+
+    let fallback_size = device_size_bytes.map(|bytes| bytes as f64 / 1024.0 / 1024.0);
+    let device_size_mib = device_size_mib.or(fallback_size).ok_or_else(|| {
+        anyhow!("Failed to determine device size for persistence")
+    })?;
+
+    log(
+        emit,
+        format!(
+            "Persistence plan: last partition {last_partition}, end {last_end:.1} MiB, device {device_size_mib:.1} MiB"
+        ),
+    );
+
+    Ok(PartedInfo {
+        device_size_mib,
+        last_end_mib: last_end,
+        last_partition,
+    })
+}
+
+fn parse_mib(text: &str) -> Option<f64> {
+    let trimmed = text.trim().trim_end_matches("MiB");
+    trimmed.parse::<f64>().ok()
+}
+
+fn sanitize_ext4_label(label: &str) -> String {
+    let mut sanitized = String::new();
+    for ch in label.chars() {
+        if sanitized.len() >= 16 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            sanitized.push(ch);
+        }
+    }
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        "persistence".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn create_persistence_conf(partition: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    if !command_exists("mount") || !command_exists("umount") {
+        log(
+            emit,
+            "Persistence label is 'persistence' but mount tools are missing".to_string(),
+        );
+        return Ok(());
+    }
+    let mount_dir = tempfile::tempdir().context("creating persistence mount dir")?;
+    let mount_args = vec![
+        partition.to_string(),
+        mount_dir.path().to_string_lossy().to_string(),
+    ];
+    run_cmd(emit, "mount", &mount_args, "mount persistence")?;
+    let conf_path = mount_dir.path().join("persistence.conf");
+    fs::write(&conf_path, "/ union\n").context("writing persistence.conf")?;
+    let umount_args = vec![mount_dir.path().to_string_lossy().to_string()];
+    run_cmd(emit, "umount", &umount_args, "umount persistence")?;
+    Ok(())
+}
+
+fn verify_dd_write(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+    let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
+    let mut src = File::open(&plan.iso_path).context("opening ISO for verify")?;
+    let mut dst = File::open(&plan.device_path)
+        .with_context(|| format!("opening device {device}", device = plan.device_path))?;
+    let mut buffer_src = vec![0u8; 4 * 1024 * 1024];
+    let mut buffer_dst = vec![0u8; 4 * 1024 * 1024];
+    let mut compared: u64 = 0;
+    let mut last_update = Instant::now();
+
+    loop {
+        let read_src = src.read(&mut buffer_src).context("reading ISO")?;
+        if read_src == 0 {
+            break;
+        }
+        dst.read_exact(&mut buffer_dst[..read_src])
+            .context("reading device")?;
+        if buffer_src[..read_src] != buffer_dst[..read_src] {
+            bail!("Verification failed at offset {compared}");
+        }
+        compared += read_src as u64;
+        if last_update.elapsed() >= Duration::from_millis(500) {
+            log(
+                emit,
+                format!(
+                    "Verifying... {percent:.0}%",
+                    percent = (compared as f64 / iso_size.max(1) as f64) * 100.0
+                ),
+            );
+            last_update = Instant::now();
+        }
+    }
+
+    log(emit, "Verification completed".to_string());
     Ok(())
 }
 
@@ -664,10 +1271,64 @@ fn run_cmd(
     }
 }
 
+fn install_bios_grub(
+    device_path: &str,
+    mount_root: &Path,
+    file_system: FileSystem,
+    emit: &mut dyn FnMut(UiEvent),
+) -> Result<()> {
+    if !command_exists("grub-install") {
+        bail!("grub-install is required for BIOS support");
+    }
+    if matches!(file_system, FileSystem::Exfat) {
+        bail!("BIOS bootloader does not support exFAT");
+    }
+
+    log(emit, "Installing BIOS bootloader (GRUB)".to_string());
+    let boot_dir = mount_root.join("boot");
+    fs::create_dir_all(&boot_dir).context("creating boot directory")?;
+
+    let mut modules = vec!["part_msdos", "part_gpt", "chain", "search_fs_file"];
+    match file_system {
+        FileSystem::Fat32 => modules.push("fat"),
+        FileSystem::Ntfs => modules.push("ntfs"),
+        FileSystem::Exfat => {}
+    }
+    let modules_arg = format!("--modules={}", modules.join(" "));
+
+    let args = vec![
+        "--target=i386-pc".to_string(),
+        format!("--boot-directory={}", boot_dir.to_string_lossy()),
+        "--recheck".to_string(),
+        modules_arg,
+        device_path.to_string(),
+    ];
+    run_cmd(emit, "grub-install", &args, "grub-install")?;
+
+    let grub_dir = boot_dir.join("grub");
+    fs::create_dir_all(&grub_dir).context("creating grub directory")?;
+    let cfg = windows_bios_grub_cfg(file_system);
+    fs::write(grub_dir.join("grub.cfg"), cfg.as_bytes()).context("writing grub.cfg")?;
+
+    Ok(())
+}
+
+fn windows_bios_grub_cfg(file_system: FileSystem) -> String {
+    let fs_module = match file_system {
+        FileSystem::Fat32 => "fat",
+        FileSystem::Ntfs => "ntfs",
+        FileSystem::Exfat => "exfat",
+    };
+    format!(
+        "set timeout=0\nset default=0\n\nmenuentry \"Windows installer\" {{\n  insmod part_msdos\n  insmod part_gpt\n  insmod {fs_module}\n  insmod chain\n  insmod search_fs_file\n  search --no-floppy --file /bootmgr --set=root\n  chainloader /bootmgr\n  boot\n}}\n"
+    )
+}
+
 fn run_rsync_with_progress(
     emit: &mut dyn FnMut(UiEvent),
     src: &Path,
     dst: &Path,
+    extra_args: &[String],
 ) -> Result<()> {
     let version = rsync_version();
     let supports_progress2 = version.is_none_or(|v| v >= (3, 1, 0));
@@ -682,6 +1343,7 @@ fn run_rsync_with_progress(
     } else {
         args.push("--progress".to_string());
     }
+    args.extend_from_slice(extra_args);
     args.push(format!("{path}/", path = src.to_string_lossy()));
     args.push(format!("{path}/", path = dst.to_string_lossy()));
 
@@ -717,6 +1379,105 @@ fn run_rsync_with_progress(
     } else {
         Err(anyhow!("rsync failed: {status}"))
     }
+}
+
+fn verify_tree_with_rsync(
+    emit: &mut dyn FnMut(UiEvent),
+    src: &Path,
+    dst: &Path,
+    extra_args: &[String],
+) -> Result<()> {
+    if !command_exists("rsync") {
+        bail!("rsync is required for verification");
+    }
+    log(emit, "Verifying files (rsync checksum)".to_string());
+    let mut args = vec![
+        "-aH".to_string(),
+        "--checksum".to_string(),
+        "--dry-run".to_string(),
+        "--itemize-changes".to_string(),
+    ];
+    args.extend_from_slice(extra_args);
+    args.push(format!("{path}/", path = src.to_string_lossy()));
+    args.push(format!("{path}/", path = dst.to_string_lossy()));
+
+    let output = Command::new("rsync")
+        .args(&args)
+        .output()
+        .context("running rsync verification")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("rsync verification failed: {stderr}");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut diffs = Vec::new();
+    for line in stdout.lines() {
+        if is_rsync_verify_diff(line) {
+            diffs.push(line.to_string());
+            if diffs.len() >= 5 {
+                break;
+            }
+        }
+    }
+    if diffs.is_empty() {
+        log(emit, "Verification OK".to_string());
+        Ok(())
+    } else {
+        bail!("Verification failed: {}", diffs.join("; "));
+    }
+}
+
+fn is_rsync_verify_diff(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("sending incremental file list")
+        || trimmed.starts_with("sending ")
+        || trimmed.starts_with("sent ")
+        || trimmed.starts_with("total size is")
+        || trimmed.starts_with("receiving ")
+        || trimmed.starts_with("created directory")
+    {
+        return false;
+    }
+    true
+}
+
+fn verify_windows_install_media(
+    iso_root: &Path,
+    usb_root: &Path,
+    emit: &mut dyn FnMut(UiEvent),
+) -> Result<()> {
+    let wim_path = iso_root.join("sources/install.wim");
+    let esd_path = iso_root.join("sources/install.esd");
+    let dest_dir = usb_root.join("sources");
+    if !wim_path.exists() && !esd_path.exists() {
+        return Ok(());
+    }
+    let src = if wim_path.exists() { wim_path } else { esd_path };
+    let size = src.metadata().context("reading install image size")?.len();
+    if size <= FAT32_LIMIT {
+        let dest = dest_dir.join(
+            src.file_name()
+                .ok_or_else(|| anyhow!("invalid install image name"))?,
+        );
+        if !dest.exists() {
+            bail!("Install image missing after copy");
+        }
+        log(emit, "Verifying install image checksum".to_string());
+        let src_hash = sha256_file(&src)?;
+        let dst_hash = sha256_file(&dest)?;
+        if src_hash != dst_hash {
+            bail!("Install image checksum mismatch");
+        }
+    } else {
+        let swm = dest_dir.join("install.swm");
+        if !swm.exists() {
+            bail!("Expected install.swm not found after split");
+        }
+    }
+    Ok(())
 }
 
 fn spawn_rsync_reader<R: Read + Send + 'static>(
@@ -831,7 +1592,7 @@ fn partition_path(device: &str) -> String {
     partition_path_for(device, 1)
 }
 
-fn partition_path_for(device: &str, index: u8) -> String {
+fn partition_path_for(device: &str, index: u32) -> String {
     let ends_with_digit = device.chars().last().is_some_and(|c| c.is_ascii_digit());
     if ends_with_digit {
         format!("{device}p{index}")

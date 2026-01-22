@@ -90,6 +90,8 @@ where
         "XAUTHORITY",
         "WAYLAND_DISPLAY",
         "XDG_RUNTIME_DIR",
+        "GNUPGHOME",
+        "GPG_TTY",
         "LANG",
         "LC_ALL",
     ] {
