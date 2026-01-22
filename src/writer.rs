@@ -73,6 +73,99 @@ pub enum UiEvent {
     Done(Result<(), String>),
 }
 
+struct ProgressState {
+    total: u64,
+    completed: u64,
+    last_emit: Instant,
+}
+
+impl ProgressState {
+    fn new(total: u64) -> Self {
+        Self {
+            total: total.max(1),
+            completed: 0,
+            last_emit: Instant::now(),
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn update(&mut self, emit: &mut dyn FnMut(UiEvent), completed: u64, force: bool) {
+        self.completed = completed.min(self.total);
+        if force || self.last_emit.elapsed() >= Duration::from_millis(200) {
+            let frac = (self.completed as f64 / self.total as f64).clamp(0.0, 1.0);
+            emit(UiEvent::Progress(frac));
+            self.last_emit = Instant::now();
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn update_stage(
+        &mut self,
+        emit: &mut dyn FnMut(UiEvent),
+        base: u64,
+        stage_size: u64,
+        frac: f64,
+        force: bool,
+    ) {
+        if stage_size == 0 {
+            self.update(emit, base, force);
+            return;
+        }
+        let stage_done = ((stage_size as f64) * frac).round() as u64;
+        self.update(emit, base.saturating_add(stage_done), force);
+    }
+
+    fn stage(&mut self, base: u64, size: u64) -> ProgressStage<'_> {
+        ProgressStage::new(self, base, size)
+    }
+}
+
+struct ProgressStage<'a> {
+    state: &'a mut ProgressState,
+    base: u64,
+    size: u64,
+    done: u64,
+}
+
+impl<'a> ProgressStage<'a> {
+    fn new(state: &'a mut ProgressState, base: u64, size: u64) -> Self {
+        Self {
+            state,
+            base,
+            size,
+            done: 0,
+        }
+    }
+
+    fn advance(&mut self, emit: &mut dyn FnMut(UiEvent), delta: u64) {
+        if self.size == 0 {
+            return;
+        }
+        self.done = self.done.saturating_add(delta).min(self.size);
+        self.state
+            .update(emit, self.base.saturating_add(self.done), false);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn set_fraction(&mut self, emit: &mut dyn FnMut(UiEvent), frac: f64) {
+        if self.size == 0 {
+            return;
+        }
+        self.done = ((self.size as f64) * frac).round() as u64;
+        if self.done > self.size {
+            self.done = self.size;
+        }
+        self.state
+            .update(emit, self.base.saturating_add(self.done), false);
+    }
+
+    fn finish(&mut self, emit: &mut dyn FnMut(UiEvent)) {
+        self.done = self.size;
+        self.state
+            .update(emit, self.base.saturating_add(self.size), true);
+    }
+}
+
 pub fn run<F>(plan: &WritePlan, mut emit: F)
 where
     F: FnMut(UiEvent),
@@ -255,10 +348,11 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
         .open(&plan.device_path)
         .with_context(|| format!("opening device {device_path}", device_path = plan.device_path))?;
 
-    let total = iso_size.max(1);
+    let verify_bytes = if plan.verify_after { iso_size } else { 0 };
+    let total = iso_size.saturating_add(verify_bytes).max(1);
     let mut written: u64 = 0;
     let mut buffer = vec![0u8; 4 * 1024 * 1024];
-    let mut last_update = Instant::now();
+    let mut progress = ProgressState::new(total);
 
     loop {
         let read = src.read(&mut buffer).context("reading ISO")?;
@@ -268,22 +362,22 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
         dst.write_all(&buffer[..read]).context("writing device")?;
         written += read as u64;
 
-        if last_update.elapsed() >= Duration::from_millis(200) {
-            #[allow(clippy::cast_precision_loss)]
-            let frac = (written as f64) / (total as f64);
-            emit(UiEvent::Progress(frac));
-            last_update = Instant::now();
-        }
+        progress.update(emit, written, false);
     }
 
-    dst.sync_all().ok();
-    emit(UiEvent::Progress(1.0));
+    dst.sync_all().context("syncing device")?;
     log(emit, "Syncing buffers".to_string());
-    let _ = Command::new("sync").status();
+    let status = Command::new("sync").status().context("running sync")?;
+    if !status.success() {
+        bail!("sync failed: {status}");
+    }
+    progress.update(emit, written, true);
 
     if plan.verify_after {
         log(emit, "Verifying written data".to_string());
-        verify_dd_write(plan, emit)?;
+        let mut verify_stage = progress.stage(written, iso_size);
+        verify_dd_write(plan, emit, Some(&mut verify_stage))?;
+        verify_stage.finish(emit);
     }
 
     if plan.persistence_size_mib > 0 {
@@ -291,6 +385,7 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
         apply_persistence(plan, emit)?;
     }
 
+    progress.update(emit, total, true);
     log(emit, "DD write completed".to_string());
     Ok(())
 }
@@ -414,15 +509,53 @@ fn write_windows_fat32(
             "--exclude=/sources/install.wim".to_string(),
             "--exclude=/sources/install.esd".to_string(),
         ];
-        run_rsync_with_progress(emit, iso_dir.path(), usb_dir.path(), &rsync_args)?;
-
         let wim_path = iso_dir.path().join("sources/install.wim");
         let esd_path = iso_dir.path().join("sources/install.esd");
-
-        if wim_path.exists() {
-            handle_wim(&wim_path, usb_dir.path(), emit)?;
+        let install_image = if wim_path.exists() {
+            Some(wim_path)
         } else if esd_path.exists() {
-            handle_wim(&esd_path, usb_dir.path(), emit)?;
+            Some(esd_path)
+        } else {
+            None
+        };
+        let install_size = match install_image.as_ref() {
+            Some(path) => path.metadata().context("reading install image size")?.len(),
+            None => 0,
+        };
+        let iso_total_bytes = match dir_size(iso_dir.path()) {
+            Ok(total) => total,
+            Err(err) => {
+                log(
+                    emit,
+                    format!("Failed to size ISO contents for progress: {err}"),
+                );
+                iso_size
+            }
+        };
+        let total_bytes = iso_total_bytes.max(install_size).max(1);
+        let rsync_bytes = if install_image.is_some() {
+            total_bytes.saturating_sub(install_size)
+        } else {
+            total_bytes
+        };
+        let mut progress = ProgressState::new(total_bytes);
+        progress.update(emit, 0, true);
+
+        {
+            let mut rsync_emit = |event| match event {
+                UiEvent::Progress(frac) => {
+                    progress.update_stage(emit, 0, rsync_bytes, frac, false);
+                }
+                UiEvent::Log(msg) => emit(UiEvent::Log(msg)),
+                UiEvent::Done(_) => {}
+            };
+            run_rsync_with_progress(&mut rsync_emit, iso_dir.path(), usb_dir.path(), &rsync_args)?;
+        }
+        progress.update(emit, rsync_bytes, true);
+
+        if let Some(install_image) = install_image {
+            let install_stage = progress.stage(rsync_bytes, install_size);
+            handle_wim(&install_image, usb_dir.path(), emit, Some(install_stage))?;
         } else {
             log(emit, "No install.wim/esd found; ISO may be non-Windows".to_string());
         }
@@ -452,7 +585,10 @@ fn write_windows_fat32(
     copy_result?;
 
     log(emit, "Syncing buffers".to_string());
-    let _ = Command::new("sync").status();
+    let status = Command::new("sync").status().context("running sync")?;
+    if !status.success() {
+        bail!("sync failed: {status}");
+    }
     emit(UiEvent::Progress(1.0));
     log(emit, "Windows FAT32 write completed".to_string());
     Ok(())
@@ -563,7 +699,10 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     copy_result?;
 
     log(emit, "Syncing buffers".to_string());
-    let _ = Command::new("sync").status();
+    let status = Command::new("sync").status().context("running sync")?;
+    if !status.success() {
+        bail!("sync failed: {status}");
+    }
     emit(UiEvent::Progress(1.0));
     log(emit, "Windows BIOS NTFS write completed".to_string());
     Ok(())
@@ -742,13 +881,21 @@ fn write_windows_ntfs_with_esp(
     copy_result?;
 
     log(emit, "Syncing buffers".to_string());
-    let _ = Command::new("sync").status();
+    let status = Command::new("sync").status().context("running sync")?;
+    if !status.success() {
+        bail!("sync failed: {status}");
+    }
     emit(UiEvent::Progress(1.0));
     log(emit, "Windows NTFS write completed".to_string());
     Ok(())
 }
 
-fn handle_wim(wim_path: &Path, usb_root: &Path, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+fn handle_wim(
+    wim_path: &Path,
+    usb_root: &Path,
+    emit: &mut dyn FnMut(UiEvent),
+    mut stage: Option<ProgressStage<'_>>,
+) -> Result<()> {
     let size = wim_path.metadata().context("reading WIM size")?.len();
     let dest_dir = usb_root.join("sources");
     fs::create_dir_all(&dest_dir).context("creating sources directory")?;
@@ -760,7 +907,10 @@ fn handle_wim(wim_path: &Path, usb_root: &Path, emit: &mut dyn FnMut(UiEvent)) -
                 .file_name()
                 .ok_or_else(|| anyhow!("invalid WIM filename"))?,
         );
-        copy_file_buffered(wim_path, &dest_path)?;
+        copy_file_buffered(wim_path, &dest_path, emit, stage.as_mut())?;
+        if let Some(stage) = stage.as_mut() {
+            stage.finish(emit);
+        }
         return Ok(());
     }
 
@@ -775,7 +925,25 @@ fn handle_wim(wim_path: &Path, usb_root: &Path, emit: &mut dyn FnMut(UiEvent)) -
             split_target_str,
             "4000".to_string(),
         ];
-        run_cmd(emit, "wimlib-imagex", &args, "wimlib-imagex split")?;
+        log(emit, "Running: wimlib-imagex split".to_string());
+        {
+            let mut progress_cb = |event| match event {
+                CmdEvent::Progress(frac) => {
+                    if let Some(stage) = stage.as_mut() {
+                        stage.set_fraction(emit, frac);
+                    }
+                }
+                CmdEvent::Log(line, _is_err) => {
+                    if !line.is_empty() {
+                        emit(UiEvent::Log(format!("wimlib-imagex: {line}")));
+                    }
+                }
+            };
+            run_cmd_with_progress("wimlib-imagex", &args, &mut progress_cb)?;
+        }
+        if let Some(stage) = stage.as_mut() {
+            stage.finish(emit);
+        }
         return Ok(());
     }
 
@@ -785,14 +953,37 @@ fn handle_wim(wim_path: &Path, usb_root: &Path, emit: &mut dyn FnMut(UiEvent)) -
             split_target_str,
             "4000".to_string(),
         ];
-        run_cmd(emit, "wimsplit", &args, "wimsplit")?;
+        log(emit, "Running: wimsplit".to_string());
+        {
+            let mut progress_cb = |event| match event {
+                CmdEvent::Progress(frac) => {
+                    if let Some(stage) = stage.as_mut() {
+                        stage.set_fraction(emit, frac);
+                    }
+                }
+                CmdEvent::Log(line, _is_err) => {
+                    if !line.is_empty() {
+                        emit(UiEvent::Log(format!("wimsplit: {line}")));
+                    }
+                }
+            };
+            run_cmd_with_progress("wimsplit", &args, &mut progress_cb)?;
+        }
+        if let Some(stage) = stage.as_mut() {
+            stage.finish(emit);
+        }
         return Ok(());
     }
 
     bail!("wimlib-imagex or wimsplit is required to split large install.wim/esd");
 }
 
-fn copy_file_buffered(src: &Path, dst: &Path) -> Result<()> {
+fn copy_file_buffered(
+    src: &Path,
+    dst: &Path,
+    emit: &mut dyn FnMut(UiEvent),
+    mut stage: Option<&mut ProgressStage<'_>>,
+) -> Result<()> {
     let mut input =
         File::open(src).with_context(|| format!("opening {path}", path = src.display()))?;
     if let Some(parent) = dst.parent() {
@@ -809,8 +1000,11 @@ fn copy_file_buffered(src: &Path, dst: &Path) -> Result<()> {
         output
             .write_all(&buffer[..read])
             .context("writing output file")?;
+        if let Some(stage) = stage.as_mut() {
+            stage.advance(emit, read as u64);
+        }
     }
-    output.sync_all().ok();
+    output.sync_all().context("syncing output file")?;
     Ok(())
 }
 
@@ -955,7 +1149,6 @@ fn create_windows_partitions_ntfs(
 struct PartedInfo {
     device_size_mib: f64,
     last_end_mib: f64,
-    last_partition: u32,
 }
 
 fn validate_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
@@ -968,7 +1161,7 @@ fn validate_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Resu
         }
     }
     let info = parted_info(&plan.device_path, plan.device_size_bytes, emit)?;
-    let (_index, _start, end) = persistence_bounds(&info, plan.persistence_size_mib)?;
+    let (_start, end) = persistence_bounds(&info, plan.persistence_size_mib)?;
     if end > info.device_size_mib {
         bail!("Not enough free space for persistence");
     }
@@ -986,7 +1179,7 @@ fn apply_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<
     }
 
     let info = parted_info(&plan.device_path, plan.device_size_bytes, emit)?;
-    let (index, start, end) = persistence_bounds(&info, plan.persistence_size_mib)?;
+    let (start, end) = persistence_bounds(&info, plan.persistence_size_mib)?;
     let start_arg = format!("{start}MiB");
     let end_arg = format!("{end}MiB");
     let mkpart_args = vec![
@@ -1001,6 +1194,7 @@ fn apply_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<
     run_cmd(emit, "parted", &mkpart_args, "parted mkpart persistence")?;
     refresh_partition_table(&plan.device_path);
 
+    let index = find_partition_for_range(&plan.device_path, start, end)?;
     let partition = partition_path_for(&plan.device_path, index);
     log(
         emit,
@@ -1024,7 +1218,7 @@ fn apply_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<
     Ok(())
 }
 
-fn persistence_bounds(info: &PartedInfo, size_mib: u64) -> Result<(u32, f64, f64)> {
+fn persistence_bounds(info: &PartedInfo, size_mib: u64) -> Result<(f64, f64)> {
     if size_mib == 0 {
         bail!("Persistence size must be greater than 0");
     }
@@ -1034,7 +1228,63 @@ fn persistence_bounds(info: &PartedInfo, size_mib: u64) -> Result<(u32, f64, f64
     if end > max_end {
         bail!("Not enough free space for persistence");
     }
-    Ok((info.last_partition + 1, start, end))
+    Ok((start, end))
+}
+
+fn find_partition_for_range(device: &str, start_mib: f64, end_mib: f64) -> Result<u32> {
+    const TOLERANCE_MIB: f64 = 2.0;
+    const MAX_ATTEMPTS: usize = 50;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for _ in 0..MAX_ATTEMPTS {
+        match partitions_from_parted(device) {
+            Ok(partitions) => {
+                for (num, part_start, part_end) in partitions {
+                    let start_delta = (part_start - start_mib).abs();
+                    let end_delta = (part_end - end_mib).abs();
+                    if start_delta <= TOLERANCE_MIB && end_delta <= TOLERANCE_MIB {
+                        return Ok(num);
+                    }
+                }
+            }
+            Err(err) => last_err = Some(err),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(err) = last_err {
+        bail!("Failed to determine persistence partition: {err}");
+    }
+    bail!("Timed out waiting for persistence partition");
+}
+
+fn partitions_from_parted(device: &str) -> Result<Vec<(u32, f64, f64)>> {
+    let output = Command::new("parted")
+        .args(["-ms", device, "unit", "MiB", "print"])
+        .output()
+        .with_context(|| format!("running parted on {device}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("parted failed: {stderr}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut partitions = Vec::new();
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line.starts_with("BYT;") || line.starts_with(device) {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let Ok(num) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        if let (Some(start), Some(end)) = (parse_mib(parts[1]), parse_mib(parts[2])) {
+            partitions.push((num, start, end));
+        }
+    }
+    Ok(partitions)
 }
 
 fn parted_info(
@@ -1053,7 +1303,6 @@ fn parted_info(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut device_size_mib = None;
     let mut last_end = 1.0;
-    let mut last_partition = 0u32;
 
     for line in stdout.lines() {
         if line.trim().is_empty() || line.starts_with("BYT;") {
@@ -1070,16 +1319,13 @@ fn parted_info(
         if parts.len() < 3 {
             continue;
         }
-        let Ok(num) = parts[0].parse::<u32>() else {
+        if parts[0].parse::<u32>().is_err() {
             continue;
-        };
+        }
         if let Some(end) = parse_mib(parts[2]) {
             if end > last_end {
                 last_end = end;
             }
-        }
-        if num > last_partition {
-            last_partition = num;
         }
     }
 
@@ -1091,14 +1337,13 @@ fn parted_info(
     log(
         emit,
         format!(
-            "Persistence plan: last partition {last_partition}, end {last_end:.1} MiB, device {device_size_mib:.1} MiB"
+            "Persistence plan: last end {last_end:.1} MiB, device {device_size_mib:.1} MiB"
         ),
     );
 
     Ok(PartedInfo {
         device_size_mib,
         last_end_mib: last_end,
-        last_partition,
     })
 }
 
@@ -1146,7 +1391,11 @@ fn create_persistence_conf(partition: &str, emit: &mut dyn FnMut(UiEvent)) -> Re
     Ok(())
 }
 
-fn verify_dd_write(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
+fn verify_dd_write(
+    plan: &WritePlan,
+    emit: &mut dyn FnMut(UiEvent),
+    mut progress: Option<&mut ProgressStage<'_>>,
+) -> Result<()> {
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
     let mut src = File::open(&plan.iso_path).context("opening ISO for verify")?;
     let mut dst = File::open(&plan.device_path)
@@ -1167,6 +1416,9 @@ fn verify_dd_write(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()
             bail!("Verification failed at offset {compared}");
         }
         compared += read_src as u64;
+        if let Some(stage) = progress.as_mut() {
+            stage.advance(emit, read_src as u64);
+        }
         if last_update.elapsed() >= Duration::from_millis(500) {
             log(
                 emit,
@@ -1271,6 +1523,51 @@ fn run_cmd(
     }
 }
 
+enum CmdEvent {
+    Progress(f64),
+    Log(String, bool),
+}
+
+fn run_cmd_with_progress<F>(program: &str, args: &[String], handle: &mut F) -> Result<()>
+where
+    F: FnMut(CmdEvent),
+{
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().with_context(|| format!("spawning {program}"))?;
+    let stdout = child.stdout.take().context("capturing command stdout")?;
+    let stderr = child.stderr.take().context("capturing command stderr")?;
+
+    let (tx, rx) = mpsc::channel::<CmdEvent>();
+    let tx_out = tx.clone();
+    let out_thread = spawn_cmd_reader(stdout, tx_out, false);
+    let tx_err = tx.clone();
+    let err_thread = spawn_cmd_reader(stderr, tx_err, true);
+    drop(tx);
+
+    let mut stderr_lines = Vec::new();
+    for event in rx {
+        if let CmdEvent::Log(line, true) = &event {
+            stderr_lines.push(line.clone());
+        }
+        handle(event);
+    }
+
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+
+    let status = child.wait().context("waiting for command")?;
+    if status.success() {
+        Ok(())
+    } else if stderr_lines.is_empty() {
+        Err(anyhow!("{program} failed: {status}"))
+    } else {
+        Err(anyhow!("{program} failed: {}", stderr_lines.join("\n")))
+    }
+}
+
 fn install_bios_grub(
     device_path: &str,
     mount_root: &Path,
@@ -1331,8 +1628,8 @@ fn run_rsync_with_progress(
     extra_args: &[String],
 ) -> Result<()> {
     let version = rsync_version();
-    let supports_progress2 = version.is_none_or(|v| v >= (3, 1, 0));
-    let supports_no_inc = version.is_none_or(|v| v >= (3, 1, 0));
+    let supports_progress2 = version.is_some_and(|v| v >= (3, 1, 0));
+    let supports_no_inc = supports_progress2;
 
     let mut args = vec!["-aH".to_string()];
     if supports_progress2 {
@@ -1508,13 +1805,52 @@ fn spawn_rsync_reader<R: Read + Send + 'static>(
     })
 }
 
+fn spawn_cmd_reader<R: Read + Send + 'static>(
+    reader: R,
+    tx: mpsc::Sender<CmdEvent>,
+    is_err: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut buf = [0u8; 4096];
+        let mut pending = String::new();
+        loop {
+            let read = reader.read(&mut buf).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            pending.push_str(&String::from_utf8_lossy(&buf[..read]));
+            while let Some(idx) = find_line_break(&pending) {
+                let line = pending[..idx].to_string();
+                pending = pending[idx + 1..].to_string();
+                handle_cmd_line(&line, &tx, is_err);
+            }
+        }
+        if !pending.is_empty() {
+            handle_cmd_line(&pending, &tx, is_err);
+        }
+    })
+}
+
+fn handle_cmd_line(line: &str, tx: &mpsc::Sender<CmdEvent>, is_err: bool) {
+    if let Some(frac) = parse_progress_percent(line) {
+        let _ = tx.send(CmdEvent::Progress(frac));
+        return;
+    }
+
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if !trimmed.is_empty() {
+        let _ = tx.send(CmdEvent::Log(trimmed.to_string(), is_err));
+    }
+}
+
 fn handle_rsync_line(
     line: &str,
     tx: &mpsc::Sender<UiEvent>,
     last_emit: &mut Instant,
     emit_logs: bool,
 ) {
-    if let Some(frac) = parse_rsync_percent(line) {
+    if let Some(frac) = parse_progress_percent(line) {
         if last_emit.elapsed() >= Duration::from_millis(200) {
             let _ = tx.send(UiEvent::Progress(frac));
             *last_emit = Instant::now();
@@ -1543,7 +1879,7 @@ fn is_rsync_progress_line(line: &str) -> bool {
         || line.contains("bytes/sec")
 }
 
-fn parse_rsync_percent(line: &str) -> Option<f64> {
+fn parse_progress_percent(line: &str) -> Option<f64> {
     for token in line.split_whitespace() {
         if let Some(raw) = token.strip_suffix('%') {
             let cleaned = raw.replace(',', "");
@@ -1586,6 +1922,27 @@ fn rsync_version() -> Option<(u32, u32, u32)> {
         }
     }
     None
+}
+
+fn dir_size(root: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            for entry in fs::read_dir(&path)
+                .with_context(|| format!("reading directory {}", path.display()))?
+            {
+                let entry = entry?;
+                stack.push(entry.path());
+            }
+        } else if file_type.is_file() || file_type.is_symlink() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn partition_path(device: &str) -> String {

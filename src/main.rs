@@ -521,7 +521,8 @@ fn build_ui(app: &adw::Application) {
             return;
         }
 
-        if !util::is_root() && !util::command_exists("pkexec") {
+        let dry_run = dry_run_toggle.is_active();
+        if !dry_run && !util::is_root() && !util::command_exists("pkexec") {
             append_log(&log_buffer, "pkexec not found; install polkit to enable admin writes.");
             return;
         }
@@ -583,7 +584,7 @@ fn build_ui(app: &adw::Application) {
             signature_path,
             persistence_size_mib,
             persistence_label,
-            dry_run: dry_run_toggle.is_active(),
+            dry_run,
         };
 
         let sender = sender.clone();
@@ -604,7 +605,7 @@ fn build_ui(app: &adw::Application) {
                         device_path = plan.device_path.as_str()
                     ),
                 );
-                if !util::is_root() {
+                if !util::is_root() && !dry_run {
                     append_log(&log_buffer, "Requesting admin access (pkexec)...");
                 }
                 progress.set_fraction(0.0);
@@ -614,7 +615,7 @@ fn build_ui(app: &adw::Application) {
 
                 let sender = sender.clone();
                 std::thread::spawn(move || {
-                    if util::is_root() {
+                    if util::is_root() || dry_run {
                         let sender = sender.clone();
                         writer::run(&plan, move |event| {
                             let _ = sender.send(event);
