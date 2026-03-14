@@ -144,7 +144,7 @@ fn build_ui(app: &adw::Application) {
     verify_row.append(&verify_desc);
     add_row(&grid, 10, "Verify", &verify_row);
 
-    let persistence_spin = gtk::SpinButton::with_range(0.0, 1048576.0, 64.0);
+    let persistence_spin = gtk::SpinButton::with_range(0.0, 1_048_576.0, 64.0);
     persistence_spin.set_value(0.0);
     let persistence_label_entry = gtk::Entry::builder()
         .text("persistence")
@@ -823,4 +823,53 @@ fn show_confirmation_dialog(
             cb();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_mount_block_root() {
+        let mounts = vec!["/".to_string()];
+        assert_eq!(system_mount_block(&mounts), Some("/".to_string()));
+    }
+
+    #[test]
+    fn system_mount_block_boot() {
+        let mounts = vec!["/boot".to_string()];
+        assert_eq!(system_mount_block(&mounts), Some("/boot".to_string()));
+    }
+
+    #[test]
+    fn system_mount_block_home() {
+        let mounts = vec!["/home".to_string()];
+        assert_eq!(system_mount_block(&mounts), Some("/home".to_string()));
+    }
+
+    #[test]
+    fn system_mount_block_safe_mount() {
+        let mounts = vec!["/mnt/usb".to_string()];
+        assert_eq!(system_mount_block(&mounts), None);
+    }
+
+    #[test]
+    fn system_mount_block_empty() {
+        let mounts: Vec<String> = vec![];
+        assert_eq!(system_mount_block(&mounts), None);
+    }
+
+    #[test]
+    fn system_mount_block_mixed() {
+        let mounts = vec!["/mnt/usb".to_string(), "/var".to_string()];
+        assert_eq!(system_mount_block(&mounts), Some("/var".to_string()));
+    }
+
+    #[test]
+    fn system_mount_block_all_protected() {
+        for path in ["/", "/boot", "/boot/efi", "/home", "/usr", "/var"] {
+            let mounts = vec![path.to_string()];
+            assert!(system_mount_block(&mounts).is_some(), "should block {path}");
+        }
+    }
 }

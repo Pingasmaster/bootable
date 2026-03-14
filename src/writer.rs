@@ -44,7 +44,6 @@ pub enum TargetSystem {
 pub enum FileSystem {
     Fat32,
     Ntfs,
-    Exfat,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,7 +114,7 @@ impl ProgressState {
         self.update(emit, base.saturating_add(stage_done), force);
     }
 
-    fn stage(&mut self, base: u64, size: u64) -> ProgressStage<'_> {
+    const fn stage(&mut self, base: u64, size: u64) -> ProgressStage<'_> {
         ProgressStage::new(self, base, size)
     }
 }
@@ -128,7 +127,7 @@ struct ProgressStage<'a> {
 }
 
 impl<'a> ProgressStage<'a> {
-    fn new(state: &'a mut ProgressState, base: u64, size: u64) -> Self {
+    const fn new(state: &'a mut ProgressState, base: u64, size: u64) -> Self {
         Self {
             state,
             base,
@@ -294,7 +293,7 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     let digest = hasher.finalize();
-    Ok(format!("{:x}", digest))
+    Ok(format!("{digest:x}"))
 }
 
 fn verify_signature(
@@ -402,7 +401,6 @@ fn write_windows_uefi(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result
     match plan.file_system {
         FileSystem::Fat32 => write_windows_fat32(plan, emit, false),
         FileSystem::Ntfs => write_windows_ntfs_uefi(plan, emit),
-        FileSystem::Exfat => bail!("Windows UEFI mode does not support exFAT"),
     }
 }
 
@@ -410,7 +408,6 @@ fn write_windows_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result
     match plan.file_system {
         FileSystem::Fat32 => write_windows_fat32(plan, emit, true),
         FileSystem::Ntfs => write_windows_ntfs_bios(plan, emit),
-        FileSystem::Exfat => bail!("Windows BIOS mode does not support exFAT"),
     }
 }
 
@@ -418,7 +415,6 @@ fn write_windows_uefi_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     match plan.file_system {
         FileSystem::Fat32 => write_windows_fat32(plan, emit, true),
         FileSystem::Ntfs => write_windows_ntfs_uefi_bios(plan, emit),
-        FileSystem::Exfat => bail!("Windows UEFI+BIOS mode does not support exFAT"),
     }
 }
 
@@ -441,10 +437,11 @@ fn write_windows_fat32(
     unmount_device(&plan.device_path, emit)?;
 
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
+    let fs_overhead = 10 * 1024 * 1024u64; // 10 MiB for partition alignment + FAT32 metadata
     if let Some(device_size) = plan.device_size_bytes
-        && iso_size > device_size
+        && iso_size + fs_overhead > device_size
     {
-        bail!("ISO is larger than the selected device");
+        bail!("ISO is too large for the selected device (accounting for filesystem overhead)");
     }
 
     if plan.dry_run {
@@ -468,6 +465,9 @@ fn write_windows_fat32(
 
     let partition = partition_path(&plan.device_path);
     let label = sanitize_fat_label(&plan.volume_label);
+    if label != plan.volume_label {
+        log(emit, format!("Volume label sanitized: \"{}\" → \"{}\"", plan.volume_label, label));
+    }
     log(emit, "Waiting for partition device".to_string());
     wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
 
@@ -621,10 +621,11 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     };
 
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
+    let fs_overhead = 10 * 1024 * 1024u64; // 10 MiB for partition alignment + NTFS metadata
     if let Some(device_size) = plan.device_size_bytes
-        && iso_size > device_size
+        && iso_size + fs_overhead > device_size
     {
-        bail!("ISO is larger than the selected device");
+        bail!("ISO is too large for the selected device (accounting for filesystem overhead)");
     }
 
     if plan.dry_run {
@@ -636,14 +637,14 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     unmount_device(&plan.device_path, emit)?;
 
     log(emit, "Partitioning device (NTFS)".to_string());
-    let scheme = if plan.partition_scheme != PartitionScheme::Mbr {
+    let scheme = if plan.partition_scheme == PartitionScheme::Mbr {
+        plan.partition_scheme
+    } else {
         log(
             emit,
             "BIOS support requires MBR; switching partition scheme to MBR".to_string(),
         );
         PartitionScheme::Mbr
-    } else {
-        plan.partition_scheme
     };
     create_ntfs_partition(&plan.device_path, scheme, emit)?;
 
@@ -652,6 +653,9 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
 
     let ntfs_label = sanitize_ntfs_label(&plan.volume_label);
+    if ntfs_label != plan.volume_label {
+        log(emit, format!("Volume label sanitized: \"{}\" → \"{}\"", plan.volume_label, ntfs_label));
+    }
     log(emit, "Formatting NTFS".to_string());
     let mkfs_ntfs_args = vec![
         "-F".to_string(),
@@ -709,14 +713,14 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
 }
 
 fn write_windows_ntfs_uefi_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
-    let scheme = if plan.partition_scheme != PartitionScheme::Mbr {
+    let scheme = if plan.partition_scheme == PartitionScheme::Mbr {
+        plan.partition_scheme
+    } else {
         log(
             emit,
             "UEFI+BIOS with NTFS requires MBR; switching partition scheme to MBR".to_string(),
         );
         PartitionScheme::Mbr
-    } else {
-        plan.partition_scheme
     };
     write_windows_ntfs_with_esp(plan, emit, scheme, true)
 }
@@ -784,6 +788,9 @@ fn write_windows_ntfs_with_esp(
 
     let esp_label = "BOOT".to_string();
     let ntfs_label = sanitize_ntfs_label(&plan.volume_label);
+    if ntfs_label != plan.volume_label {
+        log(emit, format!("Volume label sanitized: \"{}\" → \"{}\"", plan.volume_label, ntfs_label));
+    }
 
     log(emit, "Formatting ESP (FAT32)".to_string());
     let mkfs_args = vec![
@@ -1203,6 +1210,9 @@ fn apply_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<
     wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
 
     let label = sanitize_ext4_label(&plan.persistence_label);
+    if label != plan.persistence_label {
+        log(emit, format!("Persistence label sanitized: \"{}\" → \"{}\"", plan.persistence_label, label));
+    }
     let mkfs_args = vec![
         "-F".to_string(),
         "-L".to_string(),
@@ -1322,10 +1332,10 @@ fn parted_info(
         if parts[0].parse::<u32>().is_err() {
             continue;
         }
-        if let Some(end) = parse_mib(parts[2]) {
-            if end > last_end {
-                last_end = end;
-            }
+        if let Some(end) = parse_mib(parts[2])
+            && end > last_end
+        {
+            last_end = end;
         }
     }
 
@@ -1577,10 +1587,6 @@ fn install_bios_grub(
     if !command_exists("grub-install") {
         bail!("grub-install is required for BIOS support");
     }
-    if matches!(file_system, FileSystem::Exfat) {
-        bail!("BIOS bootloader does not support exFAT");
-    }
-
     log(emit, "Installing BIOS bootloader (GRUB)".to_string());
     let boot_dir = mount_root.join("boot");
     fs::create_dir_all(&boot_dir).context("creating boot directory")?;
@@ -1589,7 +1595,6 @@ fn install_bios_grub(
     match file_system {
         FileSystem::Fat32 => modules.push("fat"),
         FileSystem::Ntfs => modules.push("ntfs"),
-        FileSystem::Exfat => {}
     }
     let modules_arg = format!("--modules={}", modules.join(" "));
 
@@ -1614,7 +1619,6 @@ fn windows_bios_grub_cfg(file_system: FileSystem) -> String {
     let fs_module = match file_system {
         FileSystem::Fat32 => "fat",
         FileSystem::Ntfs => "ntfs",
-        FileSystem::Exfat => "exfat",
     };
     format!(
         "set timeout=0\nset default=0\n\nmenuentry \"Windows installer\" {{\n  insmod part_msdos\n  insmod part_gpt\n  insmod {fs_module}\n  insmod chain\n  insmod search_fs_file\n  search --no-floppy --file /bootmgr --set=root\n  chainloader /bootmgr\n  boot\n}}\n"
@@ -2391,4 +2395,620 @@ fn copy_efi(src: &Path, dst: &Path) -> Result<()> {
 
 fn log(emit: &mut dyn FnMut(UiEvent), msg: String) {
     emit(UiEvent::Log(msg));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Label sanitization ──
+
+    #[test]
+    fn fat_label_empty() {
+        assert_eq!(sanitize_fat_label(""), "BOOTABLE");
+    }
+
+    #[test]
+    fn fat_label_valid() {
+        assert_eq!(sanitize_fat_label("BOOT"), "BOOT");
+    }
+
+    #[test]
+    fn fat_label_truncates_at_11() {
+        assert_eq!(sanitize_fat_label("ABCDEFGHIJKLM"), "ABCDEFGHIJK");
+    }
+
+    #[test]
+    fn fat_label_strips_special() {
+        assert_eq!(sanitize_fat_label("boot@disk!"), "bootdisk");
+    }
+
+    #[test]
+    fn fat_label_keeps_hyphen_underscore() {
+        assert_eq!(sanitize_fat_label("MY_USB-1"), "MY_USB-1");
+    }
+
+    #[test]
+    fn fat_label_only_special_chars() {
+        assert_eq!(sanitize_fat_label("@#$%"), "BOOTABLE");
+    }
+
+    #[test]
+    fn ntfs_label_empty() {
+        assert_eq!(sanitize_ntfs_label(""), "BOOTABLE");
+    }
+
+    #[test]
+    fn ntfs_label_whitespace_only() {
+        assert_eq!(sanitize_ntfs_label("   "), "BOOTABLE");
+    }
+
+    #[test]
+    fn ntfs_label_allows_spaces() {
+        assert_eq!(sanitize_ntfs_label("My Boot Disk"), "My Boot Disk");
+    }
+
+    #[test]
+    fn ntfs_label_truncates_at_32() {
+        let long = "A".repeat(40);
+        assert_eq!(sanitize_ntfs_label(&long).len(), 32);
+    }
+
+    #[test]
+    fn ntfs_label_trims_trailing_whitespace() {
+        assert_eq!(sanitize_ntfs_label("  hello  "), "hello");
+    }
+
+    #[test]
+    fn ntfs_label_strips_special() {
+        assert_eq!(sanitize_ntfs_label("disk<>:"), "disk");
+    }
+
+    #[test]
+    fn ext4_label_empty() {
+        assert_eq!(sanitize_ext4_label(""), "persistence");
+    }
+
+    #[test]
+    fn ext4_label_valid() {
+        assert_eq!(sanitize_ext4_label("mydata"), "mydata");
+    }
+
+    #[test]
+    fn ext4_label_truncates_at_16() {
+        assert_eq!(sanitize_ext4_label("ABCDEFGHIJKLMNOPQRST"), "ABCDEFGHIJKLMNOP");
+    }
+
+    #[test]
+    fn ext4_label_strips_special() {
+        assert_eq!(sanitize_ext4_label("data@home!"), "datahome");
+    }
+
+    // ── Partition paths ──
+
+    #[test]
+    fn partition_path_sda() {
+        assert_eq!(partition_path("/dev/sda"), "/dev/sda1");
+    }
+
+    #[test]
+    fn partition_path_nvme() {
+        assert_eq!(partition_path("/dev/nvme0n1"), "/dev/nvme0n1p1");
+    }
+
+    #[test]
+    fn partition_path_for_sda_2() {
+        assert_eq!(partition_path_for("/dev/sda", 2), "/dev/sda2");
+    }
+
+    #[test]
+    fn partition_path_for_nvme_3() {
+        assert_eq!(partition_path_for("/dev/nvme0n1", 3), "/dev/nvme0n1p3");
+    }
+
+    #[test]
+    fn partition_path_for_loop() {
+        assert_eq!(partition_path_for("/dev/loop0", 1), "/dev/loop0p1");
+    }
+
+    #[test]
+    fn partition_path_for_mmcblk() {
+        assert_eq!(partition_path_for("/dev/mmcblk0", 2), "/dev/mmcblk0p2");
+    }
+
+    #[test]
+    fn partition_path_for_vda() {
+        assert_eq!(partition_path_for("/dev/vda", 1), "/dev/vda1");
+    }
+
+    // ── parse_mib ──
+
+    #[test]
+    fn parse_mib_with_suffix() {
+        assert_eq!(parse_mib("1024.5MiB"), Some(1024.5));
+    }
+
+    #[test]
+    fn parse_mib_without_suffix() {
+        assert_eq!(parse_mib("1024.5"), Some(1024.5));
+    }
+
+    #[test]
+    fn parse_mib_with_whitespace() {
+        assert_eq!(parse_mib("  512  "), Some(512.0));
+    }
+
+    #[test]
+    fn parse_mib_invalid() {
+        assert_eq!(parse_mib("abc"), None);
+    }
+
+    #[test]
+    fn parse_mib_empty() {
+        assert_eq!(parse_mib(""), None);
+    }
+
+    // ── is_sha256_hex ──
+
+    #[test]
+    fn sha256_hex_valid() {
+        let hash = "a".repeat(64);
+        assert!(is_sha256_hex(&hash));
+    }
+
+    #[test]
+    fn sha256_hex_valid_mixed_case() {
+        let hash = "aAbBcCdDeEfF0123456789".repeat(3)[..64].to_string();
+        assert!(is_sha256_hex(&hash));
+    }
+
+    #[test]
+    fn sha256_hex_too_short() {
+        let hash = "a".repeat(63);
+        assert!(!is_sha256_hex(&hash));
+    }
+
+    #[test]
+    fn sha256_hex_too_long() {
+        let hash = "a".repeat(65);
+        assert!(!is_sha256_hex(&hash));
+    }
+
+    #[test]
+    fn sha256_hex_non_hex() {
+        let hash = "g".repeat(64);
+        assert!(!is_sha256_hex(&hash));
+    }
+
+    #[test]
+    fn sha256_hex_empty() {
+        assert!(!is_sha256_hex(""));
+    }
+
+    // ── parse_checksum_text ──
+
+    #[test]
+    fn parse_checksum_valid() {
+        let hash = "a".repeat(64);
+        let text = format!("{hash}  somefile.iso");
+        let result = parse_checksum_text(&text).unwrap();
+        assert_eq!(result, hash);
+    }
+
+    #[test]
+    fn parse_checksum_uppercase() {
+        let hash = "A".repeat(64);
+        let result = parse_checksum_text(&hash).unwrap();
+        assert_eq!(result, "a".repeat(64));
+    }
+
+    #[test]
+    fn parse_checksum_no_hash() {
+        assert!(parse_checksum_text("no hash here").is_err());
+    }
+
+    #[test]
+    fn parse_checksum_hash_among_tokens() {
+        let hash = "b".repeat(64);
+        let text = format!("SHA256 = {hash}");
+        let result = parse_checksum_text(&text).unwrap();
+        assert_eq!(result, hash);
+    }
+
+    // ── parse_progress_percent ──
+
+    #[test]
+    fn progress_percent_50() {
+        let result = parse_progress_percent("50%").unwrap();
+        assert!((result - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn progress_percent_100() {
+        let result = parse_progress_percent("100%").unwrap();
+        assert!((result - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn progress_percent_0() {
+        let result = parse_progress_percent("0%").unwrap();
+        assert!((result - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn progress_percent_clamped_over_100() {
+        let result = parse_progress_percent("150%").unwrap();
+        assert!((result - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn progress_percent_multi_token() {
+        let result = parse_progress_percent("copying files 75%").unwrap();
+        assert!((result - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn progress_percent_no_percent() {
+        assert!(parse_progress_percent("50").is_none());
+    }
+
+    #[test]
+    fn progress_percent_with_comma() {
+        let result = parse_progress_percent("1,234%").unwrap();
+        assert!((result - 1.0).abs() < 1e-6); // clamped
+    }
+
+    // ── find_line_break ──
+
+    #[test]
+    fn line_break_lf() {
+        assert_eq!(find_line_break("hello\nworld"), Some(5));
+    }
+
+    #[test]
+    fn line_break_cr() {
+        assert_eq!(find_line_break("hello\rworld"), Some(5));
+    }
+
+    #[test]
+    fn line_break_crlf() {
+        assert_eq!(find_line_break("hello\r\nworld"), Some(5));
+    }
+
+    #[test]
+    fn line_break_at_start() {
+        assert_eq!(find_line_break("\nhello"), Some(0));
+    }
+
+    #[test]
+    fn line_break_none() {
+        assert_eq!(find_line_break("hello world"), None);
+    }
+
+    #[test]
+    fn line_break_empty() {
+        assert_eq!(find_line_break(""), None);
+    }
+
+    // ── is_rsync_progress_line ──
+
+    #[test]
+    fn rsync_progress_to_chk() {
+        assert!(is_rsync_progress_line("file.txt to-chk=5/10"));
+    }
+
+    #[test]
+    fn rsync_progress_xfr() {
+        assert!(is_rsync_progress_line("  xfr#1, to-chk=0/5"));
+    }
+
+    #[test]
+    fn rsync_progress_speed() {
+        assert!(is_rsync_progress_line("10.5 MB/s"));
+    }
+
+    #[test]
+    fn rsync_progress_bytes_sec() {
+        assert!(is_rsync_progress_line("1234 bytes/sec"));
+    }
+
+    #[test]
+    fn rsync_progress_plain_text() {
+        assert!(!is_rsync_progress_line("file.txt"));
+    }
+
+    #[test]
+    fn rsync_progress_empty() {
+        assert!(!is_rsync_progress_line(""));
+    }
+
+    // ── is_rsync_verify_diff ──
+
+    #[test]
+    fn rsync_diff_actual_file() {
+        assert!(is_rsync_verify_diff("sources/install.wim"));
+    }
+
+    #[test]
+    fn rsync_diff_sending_incremental() {
+        assert!(!is_rsync_verify_diff("sending incremental file list"));
+    }
+
+    #[test]
+    fn rsync_diff_sent() {
+        assert!(!is_rsync_verify_diff("sent 12345 bytes  received 100 bytes"));
+    }
+
+    #[test]
+    fn rsync_diff_total_size() {
+        assert!(!is_rsync_verify_diff("total size is 5678901"));
+    }
+
+    #[test]
+    fn rsync_diff_receiving() {
+        assert!(!is_rsync_verify_diff("receiving file list ... done"));
+    }
+
+    #[test]
+    fn rsync_diff_created_directory() {
+        assert!(!is_rsync_verify_diff("created directory /mnt/usb"));
+    }
+
+    #[test]
+    fn rsync_diff_empty() {
+        assert!(!is_rsync_verify_diff(""));
+    }
+
+    #[test]
+    fn rsync_diff_whitespace() {
+        assert!(!is_rsync_verify_diff("   "));
+    }
+
+    // ── BootArch methods ──
+
+    #[test]
+    fn boot_arch_labels() {
+        assert_eq!(BootArch::X64.label(), "x86_64");
+        assert_eq!(BootArch::Ia32.label(), "ia32");
+        assert_eq!(BootArch::Aa64.label(), "aa64");
+    }
+
+    #[test]
+    fn boot_arch_grub_targets() {
+        assert_eq!(BootArch::X64.grub_target(), "x86_64-efi");
+        assert_eq!(BootArch::Ia32.grub_target(), "i386-efi");
+        assert_eq!(BootArch::Aa64.grub_target(), "arm64-efi");
+    }
+
+    #[test]
+    fn boot_arch_module_dirs() {
+        assert_eq!(BootArch::X64.module_dir(), "x86_64-efi");
+        assert_eq!(BootArch::Ia32.module_dir(), "i386-efi");
+        assert_eq!(BootArch::Aa64.module_dir(), "arm64-efi");
+    }
+
+    #[test]
+    fn boot_arch_boot_filenames() {
+        assert_eq!(BootArch::X64.boot_filename(), "BOOTX64.EFI");
+        assert_eq!(BootArch::Ia32.boot_filename(), "BOOTIA32.EFI");
+        assert_eq!(BootArch::Aa64.boot_filename(), "BOOTAA64.EFI");
+    }
+
+    #[test]
+    fn boot_arch_grub_filenames() {
+        assert_eq!(BootArch::X64.grub_filename(), "grubx64.efi");
+        assert_eq!(BootArch::Ia32.grub_filename(), "grubia32.efi");
+        assert_eq!(BootArch::Aa64.grub_filename(), "grubaa64.efi");
+    }
+
+    #[test]
+    fn boot_arch_signed_shim_candidates_non_empty() {
+        assert!(!BootArch::X64.signed_shim_candidates().is_empty());
+        assert!(!BootArch::Ia32.signed_shim_candidates().is_empty());
+        assert!(!BootArch::Aa64.signed_shim_candidates().is_empty());
+    }
+
+    #[test]
+    fn boot_arch_signed_grub_candidates_non_empty() {
+        assert!(!BootArch::X64.signed_grub_candidates().is_empty());
+        assert!(!BootArch::Ia32.signed_grub_candidates().is_empty());
+        assert!(!BootArch::Aa64.signed_grub_candidates().is_empty());
+    }
+
+    #[test]
+    fn boot_arch_mok_manager_candidates_non_empty() {
+        assert!(!BootArch::X64.mok_manager_candidates().is_empty());
+        assert!(!BootArch::Ia32.mok_manager_candidates().is_empty());
+        assert!(!BootArch::Aa64.mok_manager_candidates().is_empty());
+    }
+
+    // ── windows_bios_grub_cfg ──
+
+    #[test]
+    fn grub_cfg_fat32() {
+        let cfg = windows_bios_grub_cfg(FileSystem::Fat32);
+        assert!(cfg.contains("insmod fat"));
+        assert!(cfg.contains("chainloader /bootmgr"));
+        assert!(cfg.contains("set timeout=0"));
+    }
+
+    #[test]
+    fn grub_cfg_ntfs() {
+        let cfg = windows_bios_grub_cfg(FileSystem::Ntfs);
+        assert!(cfg.contains("insmod ntfs"));
+        assert!(cfg.contains("chainloader /bootmgr"));
+    }
+
+    // ── persistence_bounds ──
+
+    #[test]
+    fn persistence_bounds_normal() {
+        let info = PartedInfo {
+            device_size_mib: 1000.0,
+            last_end_mib: 100.0,
+        };
+        let (start, end) = persistence_bounds(&info, 500).unwrap();
+        assert!((start - 101.0).abs() < 1e-6);
+        assert!((end - 601.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn persistence_bounds_zero_size() {
+        let info = PartedInfo {
+            device_size_mib: 1000.0,
+            last_end_mib: 100.0,
+        };
+        assert!(persistence_bounds(&info, 0).is_err());
+    }
+
+    #[test]
+    fn persistence_bounds_too_large() {
+        let info = PartedInfo {
+            device_size_mib: 200.0,
+            last_end_mib: 100.0,
+        };
+        assert!(persistence_bounds(&info, 200).is_err());
+    }
+
+    #[test]
+    fn persistence_bounds_tight_fit() {
+        // last_end=100, start=101, end=101+891=992, max_end=1000-4=996, 992 < 996 → OK
+        let info = PartedInfo {
+            device_size_mib: 1000.0,
+            last_end_mib: 100.0,
+        };
+        assert!(persistence_bounds(&info, 891).is_ok());
+    }
+
+    #[test]
+    fn persistence_bounds_exceeds_margin() {
+        // last_end=100, start=101, end=101+896=997, max_end=1000-4=996, 997 > 996 → Err
+        let info = PartedInfo {
+            device_size_mib: 1000.0,
+            last_end_mib: 100.0,
+        };
+        assert!(persistence_bounds(&info, 896).is_err());
+    }
+
+    // ── handle_cmd_line ──
+
+    #[test]
+    fn cmd_line_progress() {
+        let (tx, rx) = mpsc::channel();
+        handle_cmd_line("50%", &tx, false);
+        drop(tx);
+        let event = rx.recv().unwrap();
+        match event {
+            CmdEvent::Progress(frac) => assert!((frac - 0.5).abs() < 1e-6),
+            _ => panic!("expected Progress"),
+        }
+    }
+
+    #[test]
+    fn cmd_line_log_stdout() {
+        let (tx, rx) = mpsc::channel();
+        handle_cmd_line("some output", &tx, false);
+        drop(tx);
+        let event = rx.recv().unwrap();
+        match event {
+            CmdEvent::Log(msg, is_err) => {
+                assert_eq!(msg, "some output");
+                assert!(!is_err);
+            }
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn cmd_line_log_stderr() {
+        let (tx, rx) = mpsc::channel();
+        handle_cmd_line("error msg", &tx, true);
+        drop(tx);
+        let event = rx.recv().unwrap();
+        match event {
+            CmdEvent::Log(msg, is_err) => {
+                assert_eq!(msg, "error msg");
+                assert!(is_err);
+            }
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn cmd_line_empty_no_event() {
+        let (tx, rx) = mpsc::channel();
+        handle_cmd_line("", &tx, false);
+        drop(tx);
+        assert!(rx.recv().is_err()); // no events sent
+    }
+
+    #[test]
+    fn cmd_line_strips_trailing_newlines() {
+        let (tx, rx) = mpsc::channel();
+        handle_cmd_line("hello\r\n", &tx, false);
+        drop(tx);
+        let event = rx.recv().unwrap();
+        match event {
+            CmdEvent::Log(msg, _) => assert_eq!(msg, "hello"),
+            _ => panic!("expected Log"),
+        }
+    }
+
+    // ── handle_rsync_line ──
+
+    #[test]
+    fn rsync_line_progress() {
+        let (tx, rx) = mpsc::channel();
+        // Set last_emit to long ago so throttle doesn't suppress
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        handle_rsync_line("75%", &tx, &mut last_emit, false);
+        drop(tx);
+        let event = rx.recv().unwrap();
+        match event {
+            UiEvent::Progress(frac) => assert!((frac - 0.75).abs() < 1e-6),
+            _ => panic!("expected Progress"),
+        }
+    }
+
+    #[test]
+    fn rsync_line_progress_throttled() {
+        let (tx, rx) = mpsc::channel();
+        // Set last_emit to now — should be throttled
+        let mut last_emit = Instant::now();
+        handle_rsync_line("75%", &tx, &mut last_emit, false);
+        drop(tx);
+        // No events should be sent (throttled)
+        assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn rsync_line_log_when_enabled() {
+        let (tx, rx) = mpsc::channel();
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        handle_rsync_line("some rsync output", &tx, &mut last_emit, true);
+        drop(tx);
+        let event = rx.recv().unwrap();
+        match event {
+            UiEvent::Log(msg) => assert_eq!(msg, "rsync: some rsync output"),
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn rsync_line_no_log_when_disabled() {
+        let (tx, rx) = mpsc::channel();
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        handle_rsync_line("some rsync output", &tx, &mut last_emit, false);
+        drop(tx);
+        assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn rsync_line_empty_no_event() {
+        let (tx, rx) = mpsc::channel();
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        handle_rsync_line("", &tx, &mut last_emit, true);
+        drop(tx);
+        assert!(rx.recv().is_err());
+    }
 }

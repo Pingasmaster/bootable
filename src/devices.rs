@@ -176,3 +176,171 @@ fn collect_partition_mounts(device: &BlockDevice, out: &mut Vec<MountPoint>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_device(
+        name: &str,
+        path: Option<&str>,
+        rm: Option<bool>,
+        tran: Option<&str>,
+        mountpoints: Option<Vec<Option<String>>>,
+        children: Option<Vec<BlockDevice>>,
+    ) -> BlockDevice {
+        BlockDevice {
+            name: Some(name.to_string()),
+            device_type: "disk".to_string(),
+            size: Some(1_000_000_000),
+            model: Some("Test".to_string()),
+            tran: tran.map(|t| t.to_string()),
+            rm,
+            path: path.map(|p| p.to_string()),
+            mountpoints,
+            children,
+        }
+    }
+
+    // --- is_removable ---
+
+    #[test]
+    fn removable_rm_true() {
+        let dev = make_device("sda", None, Some(true), None, None, None);
+        assert!(is_removable(&dev));
+    }
+
+    #[test]
+    fn removable_usb_transport() {
+        let dev = make_device("sda", None, Some(false), Some("usb"), None, None);
+        assert!(is_removable(&dev));
+    }
+
+    #[test]
+    fn removable_usb_case_insensitive() {
+        let dev = make_device("sda", None, Some(false), Some("USB"), None, None);
+        assert!(is_removable(&dev));
+    }
+
+    #[test]
+    fn not_removable_sata() {
+        let dev = make_device("sda", None, Some(false), Some("sata"), None, None);
+        assert!(!is_removable(&dev));
+    }
+
+    #[test]
+    fn not_removable_no_info() {
+        let dev = make_device("sda", None, None, None, None, None);
+        assert!(!is_removable(&dev));
+    }
+
+    // --- find_device ---
+
+    #[test]
+    fn find_device_at_root() {
+        let devices = vec![
+            make_device("sda", Some("/dev/sda"), None, None, None, None),
+            make_device("sdb", Some("/dev/sdb"), None, None, None, None),
+        ];
+        let found = find_device(&devices, "/dev/sdb");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().path.as_deref(), Some("/dev/sdb"));
+    }
+
+    #[test]
+    fn find_device_in_children() {
+        let child = make_device("sda1", Some("/dev/sda1"), None, None, None, None);
+        let parent = make_device("sda", Some("/dev/sda"), None, None, None, Some(vec![child]));
+        let devices = [parent];
+        let found = find_device(&devices, "/dev/sda1");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().path.as_deref(), Some("/dev/sda1"));
+    }
+
+    #[test]
+    fn find_device_not_found() {
+        let devices = vec![make_device("sda", Some("/dev/sda"), None, None, None, None)];
+        assert!(find_device(&devices, "/dev/sdb").is_none());
+    }
+
+    #[test]
+    fn find_device_empty_list() {
+        assert!(find_device(&[], "/dev/sda").is_none());
+    }
+
+    // --- collect_partition_mounts ---
+
+    #[test]
+    fn collect_mounts_basic() {
+        let dev = make_device(
+            "sda1",
+            Some("/dev/sda1"),
+            None,
+            None,
+            Some(vec![Some("/mnt/usb".to_string())]),
+            None,
+        );
+        let mut out = Vec::new();
+        collect_partition_mounts(&dev, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "/dev/sda1");
+        assert_eq!(out[0].mountpoint, "/mnt/usb");
+    }
+
+    #[test]
+    fn collect_mounts_nested_children() {
+        let child = make_device(
+            "sda1",
+            Some("/dev/sda1"),
+            None,
+            None,
+            Some(vec![Some("/mnt/data".to_string())]),
+            None,
+        );
+        let parent = make_device("sda", Some("/dev/sda"), None, None, None, Some(vec![child]));
+        let mut out = Vec::new();
+        collect_partition_mounts(&parent, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mountpoint, "/mnt/data");
+    }
+
+    #[test]
+    fn collect_mounts_empty_mountpoints_skipped() {
+        let dev = make_device(
+            "sda1",
+            Some("/dev/sda1"),
+            None,
+            None,
+            Some(vec![Some("".to_string()), None, Some("/mnt/usb".to_string())]),
+            None,
+        );
+        let mut out = Vec::new();
+        collect_partition_mounts(&dev, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mountpoint, "/mnt/usb");
+    }
+
+    #[test]
+    fn collect_mounts_no_mounts() {
+        let dev = make_device("sda", Some("/dev/sda"), None, None, None, None);
+        let mut out = Vec::new();
+        collect_partition_mounts(&dev, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_mounts_fallback_to_name() {
+        let dev = make_device(
+            "sda1",
+            None, // no path
+            None,
+            None,
+            Some(vec![Some("/mnt/usb".to_string())]),
+            None,
+        );
+        let mut out = Vec::new();
+        collect_partition_mounts(&dev, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "/dev/sda1");
+    }
+}

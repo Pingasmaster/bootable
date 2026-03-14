@@ -199,3 +199,88 @@ fn parse_helper_line(line: &str) -> Option<UiEvent> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_log() {
+        let event = parse_helper_line("LOG\tHello world").unwrap();
+        match event {
+            UiEvent::Log(msg) => assert_eq!(msg, "Hello world"),
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn parse_log_empty_message() {
+        let event = parse_helper_line("LOG\t").unwrap();
+        match event {
+            UiEvent::Log(msg) => assert_eq!(msg, ""),
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn parse_log_no_tab() {
+        // "LOG" alone with no tab — parts.next() for message returns None, unwrap_or_default → ""
+        let event = parse_helper_line("LOG").unwrap();
+        match event {
+            UiEvent::Log(msg) => assert_eq!(msg, ""),
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn parse_progress() {
+        let event = parse_helper_line("PROGRESS\t0.750000").unwrap();
+        match event {
+            UiEvent::Progress(frac) => assert!((frac - 0.75).abs() < 1e-6),
+            _ => panic!("expected Progress"),
+        }
+    }
+
+    #[test]
+    fn parse_progress_invalid() {
+        assert!(parse_helper_line("PROGRESS\tabc").is_none());
+    }
+
+    #[test]
+    fn parse_done_ok() {
+        let event = parse_helper_line("DONE\tOK").unwrap();
+        match event {
+            UiEvent::Done(Ok(())) => {}
+            _ => panic!("expected Done(Ok)"),
+        }
+    }
+
+    #[test]
+    fn parse_done_err() {
+        let event = parse_helper_line("DONE\tERR\tSomething went wrong").unwrap();
+        match event {
+            UiEvent::Done(Err(msg)) => assert_eq!(msg, "Something went wrong"),
+            _ => panic!("expected Done(Err)"),
+        }
+    }
+
+    #[test]
+    fn parse_done_err_no_message() {
+        let event = parse_helper_line("DONE\tERR").unwrap();
+        match event {
+            UiEvent::Done(Err(msg)) => assert_eq!(msg, "Helper failed"),
+            _ => panic!("expected Done(Err)"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_tag() {
+        assert!(parse_helper_line("UNKNOWN\tdata").is_none());
+    }
+
+    #[test]
+    fn parse_empty_line() {
+        // Empty string → parts.next() returns Some(""), which is not a known tag
+        assert!(parse_helper_line("").is_none());
+    }
+}
