@@ -110,6 +110,7 @@ impl ProgressState {
             self.update(emit, base, force);
             return;
         }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let stage_done = ((stage_size as f64) * frac).round() as u64;
         self.update(emit, base.saturating_add(stage_done), force);
     }
@@ -150,7 +151,8 @@ impl<'a> ProgressStage<'a> {
         if self.size == 0 {
             return;
         }
-        self.done = ((self.size as f64) * frac).round() as u64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        { self.done = ((self.size as f64) * frac).round() as u64; }
         if self.done > self.size {
             self.done = self.size;
         }
@@ -418,6 +420,7 @@ fn write_windows_uefi_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_windows_fat32(
     plan: &WritePlan,
     emit: &mut dyn FnMut(UiEvent),
@@ -1233,6 +1236,7 @@ fn persistence_bounds(info: &PartedInfo, size_mib: u64) -> Result<(f64, f64)> {
         bail!("Persistence size must be greater than 0");
     }
     let start = (info.last_end_mib + 1.0).ceil();
+    #[allow(clippy::cast_precision_loss)]
     let end = start + size_mib as f64;
     let max_end = info.device_size_mib - 4.0;
     if end > max_end {
@@ -1339,6 +1343,7 @@ fn parted_info(
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
     let fallback_size = device_size_bytes.map(|bytes| bytes as f64 / 1024.0 / 1024.0);
     let device_size_mib = device_size_mib.or(fallback_size).ok_or_else(|| {
         anyhow!("Failed to determine device size for persistence")
@@ -1434,7 +1439,10 @@ fn verify_dd_write(
                 emit,
                 format!(
                     "Verifying... {percent:.0}%",
-                    percent = (compared as f64 / iso_size.max(1) as f64) * 100.0
+                    percent = {
+                        #[allow(clippy::cast_precision_loss)]
+                        { (compared as f64 / iso_size.max(1) as f64) * 100.0 }
+                    }
                 ),
             );
             last_update = Instant::now();
@@ -3010,5 +3018,111 @@ mod tests {
         handle_rsync_line("", &tx, &mut last_emit, true);
         drop(tx);
         assert!(rx.recv().is_err());
+    }
+
+    // ── persistence_bounds with fractional last_end ──
+
+    #[test]
+    fn persistence_bounds_fractional_last_end() {
+        // last_end=100.5, start=ceil(101.5)=102, end=102+500=602, max_end=1000-4=996
+        let info = PartedInfo {
+            device_size_mib: 1000.0,
+            last_end_mib: 100.5,
+        };
+        let (start, end) = persistence_bounds(&info, 500).unwrap();
+        assert!((start - 102.0).abs() < 1e-6);
+        assert!((end - 602.0).abs() < 1e-6);
+    }
+
+    // ── parse_mib edge cases ──
+
+    #[test]
+    fn parse_mib_only_suffix() {
+        assert_eq!(parse_mib("MiB"), None);
+    }
+
+    #[test]
+    fn parse_mib_zero() {
+        assert_eq!(parse_mib("0MiB"), Some(0.0));
+    }
+
+    // ── resolve_checksum with file ──
+
+    #[test]
+    fn resolve_checksum_from_file() {
+        let hash = "a".repeat(64);
+        let content = format!("{hash}  somefile.iso\n");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("checksum.sha256");
+        fs::write(&file_path, &content).unwrap();
+        let result = resolve_checksum(file_path.to_str().unwrap()).unwrap();
+        assert_eq!(result, hash);
+    }
+
+    #[test]
+    fn resolve_checksum_from_file_no_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("bad.sha256");
+        fs::write(&file_path, "no hash here\n").unwrap();
+        assert!(resolve_checksum(file_path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn resolve_checksum_inline() {
+        let hash = "b".repeat(64);
+        let result = resolve_checksum(&hash).unwrap();
+        assert_eq!(result, hash);
+    }
+
+    #[test]
+    fn resolve_checksum_empty() {
+        assert!(resolve_checksum("").is_err());
+        assert!(resolve_checksum("   ").is_err());
+    }
+
+    // ── fat label does not uppercase ──
+
+    #[test]
+    fn fat_label_preserves_case() {
+        assert_eq!(sanitize_fat_label("bootable"), "bootable");
+    }
+
+    // ── ext4 label allows hyphen and underscore ──
+
+    #[test]
+    fn ext4_label_keeps_hyphen_underscore() {
+        assert_eq!(sanitize_ext4_label("my-data_1"), "my-data_1");
+    }
+
+    #[test]
+    fn ext4_label_only_special_chars() {
+        assert_eq!(sanitize_ext4_label("@#$%"), "persistence");
+    }
+
+    // ── dir_size ──
+
+    #[test]
+    fn dir_size_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(dir_size(dir.path()).unwrap(), 0);
+    }
+
+    #[test]
+    fn dir_size_with_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        fs::write(dir.path().join("b.txt"), "world!").unwrap();
+        let size = dir_size(dir.path()).unwrap();
+        assert_eq!(size, 11); // 5 + 6
+    }
+
+    #[test]
+    fn dir_size_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("file.txt"), "data").unwrap();
+        let size = dir_size(dir.path()).unwrap();
+        assert_eq!(size, 4);
     }
 }

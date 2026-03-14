@@ -19,10 +19,11 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 pub fn command_exists(cmd: &str) -> bool {
-    let script = format!("command -v {cmd} >/dev/null 2>&1");
     Command::new("sh")
         .arg("-c")
-        .arg(script)
+        .arg("command -v -- \"$1\" >/dev/null 2>&1")
+        .arg("--")
+        .arg(cmd)
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -87,5 +88,17 @@ mod tests {
     #[test]
     fn command_exists_unknown() {
         assert!(!command_exists("zzz_no_such_command_12345"));
+    }
+
+    #[test]
+    fn command_exists_rejects_shell_metacharacters() {
+        // Should return false, not execute the injected command
+        assert!(!command_exists("ls; echo pwned"));
+        assert!(!command_exists("$(echo ls)"));
+    }
+
+    #[test]
+    fn command_exists_empty() {
+        assert!(!command_exists(""));
     }
 }

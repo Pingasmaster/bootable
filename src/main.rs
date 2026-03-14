@@ -566,6 +566,7 @@ fn build_ui(app: &adw::Application) {
                 Some(PathBuf::from(text))
             }
         };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let persistence_size_mib = persistence_spin.value() as u64;
         let persistence_label = persistence_label_entry.text().to_string();
 
@@ -697,7 +698,7 @@ fn refresh_devices(
             }
             if let Some(path) = previous_path {
                 if let Some(idx) = devices_state.borrow().iter().position(|dev| dev.path == path) {
-                    device_dropdown.set_selected(idx as u32);
+                    device_dropdown.set_selected(u32::try_from(idx).unwrap_or(gtk::INVALID_LIST_POSITION));
                 } else {
                     device_dropdown.set_selected(gtk::INVALID_LIST_POSITION);
                 }

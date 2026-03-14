@@ -3,6 +3,10 @@
 Bootable is a simple graphical app for writing bootable USB drives from ISO
 or disk image files.
 
+Bootable has the same options as rufus on windows, because I loved rufus' 
+versatility but missed it heavily on Linux. It can flash both
+Linux and Windows ISOs.
+
 ## Build and run
 
 Requirements:
