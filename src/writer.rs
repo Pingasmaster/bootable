@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::FileTypeExt;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -344,6 +345,7 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     log(emit, "Writing ISO (DD mode)".to_string());
 
     let mut src = File::open(&plan.iso_path).context("opening ISO")?;
+    ensure_block_device(&plan.device_path)?;
     let mut dst = OpenOptions::new()
         .write(true)
         .open(&plan.device_path)
@@ -1957,6 +1959,16 @@ fn dir_size(root: &Path) -> Result<u64> {
     Ok(total)
 }
 
+fn ensure_block_device(path: &str) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading metadata for {path}"))?;
+    let file_type = metadata.file_type();
+    if !file_type.is_block_device() {
+        bail!("{path} is not a block device");
+    }
+    Ok(())
+}
+
 fn partition_path(device: &str) -> String {
     partition_path_for(device, 1)
 }
@@ -2257,10 +2269,12 @@ fn install_uefi_ntfs_loaders(
     fs::create_dir_all(&boot_grub_dir).ok();
     let _ = fs::write(boot_grub_dir.join("grub.cfg"), grub_cfg.as_bytes());
 
+    let tmp_dir = std::env::var("XDG_RUNTIME_DIR")
+        .map_or_else(|_| std::env::temp_dir(), PathBuf::from);
     let mut cfg_file = tempfile::Builder::new()
         .prefix("grub-")
         .suffix(".cfg")
-        .tempfile_in("/tmp")
+        .tempfile_in(tmp_dir)
         .context("creating grub cfg")?;
     cfg_file
         .write_all(grub_cfg.as_bytes())

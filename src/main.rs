@@ -714,9 +714,12 @@ fn refresh_devices(
 }
 
 fn system_mount_block(mountpoints: &[String]) -> Option<String> {
-    let protected = ["/", "/boot", "/boot/efi", "/home", "/usr", "/var"];
+    let allowed_prefixes = ["/mnt/", "/media/", "/run/media/"];
     for mount in mountpoints {
-        if protected.contains(&mount.as_str()) {
+        let dominated_by_allowed = allowed_prefixes
+            .iter()
+            .any(|prefix| mount.starts_with(prefix));
+        if !dominated_by_allowed {
             return Some(mount.clone());
         }
     }
@@ -855,6 +858,18 @@ mod tests {
     }
 
     #[test]
+    fn system_mount_block_media_mount() {
+        let mounts = vec!["/media/user/USBDRIVE".to_string()];
+        assert_eq!(system_mount_block(&mounts), None);
+    }
+
+    #[test]
+    fn system_mount_block_run_media() {
+        let mounts = vec!["/run/media/user/disk".to_string()];
+        assert_eq!(system_mount_block(&mounts), None);
+    }
+
+    #[test]
     fn system_mount_block_empty() {
         let mounts: Vec<String> = vec![];
         assert_eq!(system_mount_block(&mounts), None);
@@ -868,7 +883,9 @@ mod tests {
 
     #[test]
     fn system_mount_block_all_protected() {
-        for path in ["/", "/boot", "/boot/efi", "/home", "/usr", "/var"] {
+        for path in ["/", "/boot", "/boot/efi", "/home", "/usr", "/var",
+                     "/root", "/etc", "/opt", "/srv", "/run", "/tmp",
+                     "/proc", "/sys", "/dev", "/snap", "/nix"] {
             let mounts = vec![path.to_string()];
             assert!(system_mount_block(&mounts).is_some(), "should block {path}");
         }

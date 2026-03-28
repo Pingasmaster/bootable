@@ -166,11 +166,15 @@ fn read_plan(path: &Path) -> Result<WritePlan> {
     serde_json::from_slice(&data).context("parsing plan JSON")
 }
 
+fn preferred_tmp_dir() -> PathBuf {
+    env::var("XDG_RUNTIME_DIR").map_or_else(|_| env::temp_dir(), PathBuf::from)
+}
+
 fn write_plan(plan: &WritePlan) -> Result<PathBuf> {
     let mut file = tempfile::Builder::new()
         .prefix("bootable-plan-")
         .suffix(".json")
-        .tempfile_in("/tmp")
+        .tempfile_in(preferred_tmp_dir())
         .context("creating temp file")?;
     serde_json::to_writer(&mut file, plan).context("serializing plan")?;
     file.flush().ok();
