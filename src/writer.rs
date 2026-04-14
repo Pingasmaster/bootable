@@ -324,9 +324,6 @@ fn verify_signature(
 }
 
 fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
-    log(emit, "Preparing device (unmounting)".to_string());
-    unmount_device(&plan.device_path, emit)?;
-
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
     if let Some(device_size) = plan.device_size_bytes
         && iso_size > device_size
@@ -341,6 +338,9 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
         }
         return Ok(());
     }
+
+    log(emit, "Preparing device (unmounting)".to_string());
+    unmount_device(&plan.device_path, emit)?;
 
     log(emit, "Writing ISO (DD mode)".to_string());
 
@@ -438,13 +438,10 @@ fn write_windows_fat32(
         }
     }
 
-    log(emit, "Preparing device (unmounting)".to_string());
-    unmount_device(&plan.device_path, emit)?;
-
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
     let fs_overhead = 10 * 1024 * 1024u64; // 10 MiB for partition alignment + FAT32 metadata
     if let Some(device_size) = plan.device_size_bytes
-        && iso_size + fs_overhead > device_size
+        && iso_size.saturating_add(fs_overhead) > device_size
     {
         bail!("ISO is too large for the selected device (accounting for filesystem overhead)");
     }
@@ -453,6 +450,9 @@ fn write_windows_fat32(
         log(emit, "Dry run: would format and copy Windows files (FAT32)".to_string());
         return Ok(());
     }
+
+    log(emit, "Preparing device (unmounting)".to_string());
+    unmount_device(&plan.device_path, emit)?;
 
     log(emit, "Partitioning device".to_string());
     let scheme = if install_bios {
@@ -628,7 +628,7 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
     let fs_overhead = 10 * 1024 * 1024u64; // 10 MiB for partition alignment + NTFS metadata
     if let Some(device_size) = plan.device_size_bytes
-        && iso_size + fs_overhead > device_size
+        && iso_size.saturating_add(fs_overhead) > device_size
     {
         bail!("ISO is too large for the selected device (accounting for filesystem overhead)");
     }
@@ -740,7 +740,7 @@ fn write_windows_ntfs_with_esp(
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
     if let Some(device_size) = plan.device_size_bytes {
         let overhead = 260 * 1024 * 1024u64;
-        if iso_size + overhead > device_size {
+        if iso_size.saturating_add(overhead) > device_size {
             bail!("ISO is too large for the selected device");
         }
     }

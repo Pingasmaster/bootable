@@ -198,6 +198,7 @@ fn build_ui(app: &adw::Application) {
 
     let devices_state: Rc<RefCell<Vec<devices::Device>>> = Rc::new(RefCell::new(Vec::new()));
     let flashing: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let dialog_open: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     let update_controls: Rc<dyn Fn()> = {
         let mode_dropdown = mode_dropdown.clone();
@@ -487,6 +488,9 @@ fn build_ui(app: &adw::Application) {
     });
 
     start_button.connect_clicked(move |_| {
+        if *dialog_open.borrow() {
+            return;
+        }
         let iso_text = iso_entry.text().to_string();
         if iso_text.trim().is_empty() {
             append_log(&log_buffer, "Select an image first");
@@ -594,6 +598,8 @@ fn build_ui(app: &adw::Application) {
         let log_buffer = log_buffer.clone();
         let flashing = flashing.clone();
 
+        *dialog_open.borrow_mut() = true;
+        let dialog_open_close = dialog_open.clone();
         show_confirmation_dialog(
             &window,
             device,
@@ -632,6 +638,7 @@ fn build_ui(app: &adw::Application) {
                     }
                 });
             },
+            move || *dialog_open_close.borrow_mut() = false,
         );
     });
 }
@@ -731,6 +738,7 @@ fn show_confirmation_dialog(
     device: &devices::Device,
     mountpoints: &[String],
     on_confirm: impl FnOnce() + 'static,
+    on_close: impl Fn() + 'static,
 ) {
     let dialog = gtk::Window::builder()
         .transient_for(window)
@@ -800,6 +808,10 @@ fn show_confirmation_dialog(
     container.append(&buttons);
 
     dialog.set_child(Some(&container));
+    dialog.connect_close_request(move |_| {
+        on_close();
+        glib::Propagation::Proceed
+    });
     dialog.present();
 
     let dialog_for_cancel = dialog.clone();

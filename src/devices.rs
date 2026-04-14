@@ -76,7 +76,7 @@ pub fn list_removable() -> Result<Vec<Device>> {
         let size = dev.size;
         let size_display = size.map_or_else(|| "unknown".to_string(), format_bytes);
         let model = dev.model.unwrap_or_else(|| "Unknown".to_string());
-        let tran = dev.tran.unwrap_or_else(String::new);
+        let tran = dev.tran.unwrap_or_default();
         let display = if tran.is_empty() {
             format!("{path} • {size_display} • {model}")
         } else {

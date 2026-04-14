@@ -39,7 +39,7 @@ pub fn run_helper(plan_path: &Path) -> glib::ExitCode {
             let mut emit = |event: UiEvent| {
                 match event {
                     UiEvent::Log(msg) => {
-                        let _ = writeln!(stdout, "LOG\t{msg}");
+                        let _ = writeln!(stdout, "LOG\t{}", sanitize_line(&msg));
                     }
                     UiEvent::Progress(frac) => {
                         let _ = writeln!(stdout, "PROGRESS\t{frac:.6}");
@@ -50,7 +50,7 @@ pub fn run_helper(plan_path: &Path) -> glib::ExitCode {
                         }
                         Err(err) => {
                             ok = false;
-                            let _ = writeln!(stdout, "DONE\tERR\t{err}");
+                            let _ = writeln!(stdout, "DONE\tERR\t{}", sanitize_line(&err));
                         }
                     },
                 }
@@ -182,22 +182,24 @@ fn write_plan(plan: &WritePlan) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn sanitize_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\r' || c == '\n' || c == '\t' { ' ' } else { c })
+        .collect()
+}
+
 fn parse_helper_line(line: &str) -> Option<UiEvent> {
-    let mut parts = line.splitn(3, '\t');
-    let tag = parts.next()?;
+    let (tag, rest) = line.split_once('\t').map_or((line, ""), |(t, r)| (t, r));
     match tag {
-        "LOG" => Some(UiEvent::Log(parts.next().unwrap_or_default().to_string())),
-        "PROGRESS" => parts
-            .next()
-            .and_then(|val| val.parse::<f64>().ok())
-            .map(UiEvent::Progress),
+        "LOG" => Some(UiEvent::Log(rest.to_string())),
+        "PROGRESS" => rest.parse::<f64>().ok().map(UiEvent::Progress),
         "DONE" => {
-            let status = parts.next().unwrap_or_default();
+            let (status, err) = rest.split_once('\t').map_or((rest, ""), |(s, e)| (s, e));
             if status == "OK" {
                 Some(UiEvent::Done(Ok(())))
             } else {
-                let err = parts.next().unwrap_or("Helper failed").to_string();
-                Some(UiEvent::Done(Err(err)))
+                let msg = if err.is_empty() { "Helper failed".to_string() } else { err.to_string() };
+                Some(UiEvent::Done(Err(msg)))
             }
         }
         _ => None,
@@ -284,7 +286,50 @@ mod tests {
 
     #[test]
     fn parse_empty_line() {
-        // Empty string → parts.next() returns Some(""), which is not a known tag
         assert!(parse_helper_line("").is_none());
+    }
+
+    #[test]
+    fn parse_log_with_tabs_preserved() {
+        let event = parse_helper_line("LOG\thello\tworld").unwrap();
+        match event {
+            UiEvent::Log(msg) => assert_eq!(msg, "hello\tworld"),
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn parse_done_err_with_tabs_in_message() {
+        let event = parse_helper_line("DONE\tERR\tfirst\tpart").unwrap();
+        match event {
+            UiEvent::Done(Err(msg)) => assert_eq!(msg, "first\tpart"),
+            _ => panic!("expected Done(Err)"),
+        }
+    }
+
+    #[test]
+    fn sanitize_line_replaces_control_chars() {
+        assert_eq!(sanitize_line("hello\nworld"), "hello world");
+        assert_eq!(sanitize_line("a\tb\rc"), "a b c");
+        assert_eq!(sanitize_line("multi\r\nline\ttext"), "multi  line text");
+    }
+
+    #[test]
+    fn sanitize_line_pass_through() {
+        assert_eq!(sanitize_line("no control chars"), "no control chars");
+        assert_eq!(sanitize_line(""), "");
+    }
+
+    #[test]
+    fn parse_survives_injection_attempt() {
+        // Message that was sanitized at the helper side: no newlines reach the parser.
+        // Verify that a sanitized "injection" is preserved as a single LOG, not split.
+        let sanitized = sanitize_line("error\nDONE\tOK");
+        let line = format!("LOG\t{sanitized}");
+        let event = parse_helper_line(&line).unwrap();
+        match event {
+            UiEvent::Log(msg) => assert_eq!(msg, "error DONE OK"),
+            _ => panic!("expected Log"),
+        }
     }
 }
