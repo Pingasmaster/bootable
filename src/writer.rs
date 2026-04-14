@@ -1990,6 +1990,27 @@ fn ensure_iso_is_not_device(iso_path: &Path, device_path: &str) -> Result<()> {
     if canonical_iso == canonical_device {
         bail!("ISO path and target device resolve to the same location");
     }
+
+    // Also reject ISOs that live on any partition of the target device. If we
+    // proceeded, the write flow would unmount the partition (hiding the ISO's
+    // backing data) and then wipe the disk mid-read, corrupting the source
+    // and producing garbage on the target.
+    let mounts = devices::partitions_with_mountpoints(device_path).unwrap_or_default();
+    for mp in mounts {
+        let mountpoint = Path::new(&mp.mountpoint);
+        if mountpoint.as_os_str().is_empty() || !mountpoint.is_absolute() {
+            continue;
+        }
+        if canonical_iso.starts_with(mountpoint) {
+            bail!(
+                "ISO {iso} is on the target device {device} (mounted at {mountpoint})",
+                iso = canonical_iso.display(),
+                device = device_path,
+                mountpoint = mountpoint.display()
+            );
+        }
+    }
+
     Ok(())
 }
 
