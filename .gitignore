@@ -6,3 +6,8 @@
 *.rs.bk
 .DS_Store
 bootable
+
+# Claude Code
+/CLAUDE.md
+/CLAUDE.local.md
+/.claude/
