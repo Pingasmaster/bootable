@@ -194,9 +194,9 @@ mod tests {
             device_type: "disk".to_string(),
             size: Some(1_000_000_000),
             model: Some("Test".to_string()),
-            tran: tran.map(|t| t.to_string()),
+            tran: tran.map(str::to_string),
             rm,
-            path: path.map(|p| p.to_string()),
+            path: path.map(str::to_string),
             mountpoints,
             children,
         }
@@ -311,7 +311,7 @@ mod tests {
             Some("/dev/sda1"),
             None,
             None,
-            Some(vec![Some("".to_string()), None, Some("/mnt/usb".to_string())]),
+            Some(vec![Some(String::new()), None, Some("/mnt/usb".to_string())]),
             None,
         );
         let mut out = Vec::new();

@@ -2948,7 +2948,7 @@ mod tests {
         let event = rx.recv().unwrap();
         match event {
             CmdEvent::Progress(frac) => assert!((frac - 0.5).abs() < 1e-6),
-            _ => panic!("expected Progress"),
+            CmdEvent::Log(..) => panic!("expected Progress"),
         }
     }
 
@@ -2963,7 +2963,7 @@ mod tests {
                 assert_eq!(msg, "some output");
                 assert!(!is_err);
             }
-            _ => panic!("expected Log"),
+            CmdEvent::Progress(_) => panic!("expected Log"),
         }
     }
 
@@ -2978,7 +2978,7 @@ mod tests {
                 assert_eq!(msg, "error msg");
                 assert!(is_err);
             }
-            _ => panic!("expected Log"),
+            CmdEvent::Progress(_) => panic!("expected Log"),
         }
     }
 
@@ -2998,7 +2998,7 @@ mod tests {
         let event = rx.recv().unwrap();
         match event {
             CmdEvent::Log(msg, _) => assert_eq!(msg, "hello"),
-            _ => panic!("expected Log"),
+            CmdEvent::Progress(_) => panic!("expected Log"),
         }
     }
 
@@ -3008,13 +3008,15 @@ mod tests {
     fn rsync_line_progress() {
         let (tx, rx) = mpsc::channel();
         // Set last_emit to long ago so throttle doesn't suppress
-        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("Instant - 1s should not underflow");
         handle_rsync_line("75%", &tx, &mut last_emit, false);
         drop(tx);
         let event = rx.recv().unwrap();
         match event {
             UiEvent::Progress(frac) => assert!((frac - 0.75).abs() < 1e-6),
-            _ => panic!("expected Progress"),
+            UiEvent::Log(_) | UiEvent::Done(_) => panic!("expected Progress"),
         }
     }
 
@@ -3032,20 +3034,24 @@ mod tests {
     #[test]
     fn rsync_line_log_when_enabled() {
         let (tx, rx) = mpsc::channel();
-        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("Instant - 1s should not underflow");
         handle_rsync_line("some rsync output", &tx, &mut last_emit, true);
         drop(tx);
         let event = rx.recv().unwrap();
         match event {
             UiEvent::Log(msg) => assert_eq!(msg, "rsync: some rsync output"),
-            _ => panic!("expected Log"),
+            UiEvent::Progress(_) | UiEvent::Done(_) => panic!("expected Log"),
         }
     }
 
     #[test]
     fn rsync_line_no_log_when_disabled() {
         let (tx, rx) = mpsc::channel();
-        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("Instant - 1s should not underflow");
         handle_rsync_line("some rsync output", &tx, &mut last_emit, false);
         drop(tx);
         assert!(rx.recv().is_err());
@@ -3054,7 +3060,9 @@ mod tests {
     #[test]
     fn rsync_line_empty_no_event() {
         let (tx, rx) = mpsc::channel();
-        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut last_emit = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("Instant - 1s should not underflow");
         handle_rsync_line("", &tx, &mut last_emit, true);
         drop(tx);
         assert!(rx.recv().is_err());
