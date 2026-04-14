@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::process::Command;
 
@@ -56,7 +56,8 @@ pub fn list_removable() -> Result<Vec<Device>> {
         ));
     }
 
-    let parsed: LsblkOutput = serde_json::from_slice(&output.stdout).context("parsing lsblk JSON")?;
+    let parsed: LsblkOutput =
+        serde_json::from_slice(&output.stdout).context("parsing lsblk JSON")?;
     let mut devices = Vec::new();
 
     for dev in parsed.blockdevices {
@@ -113,7 +114,8 @@ pub fn partitions_with_mountpoints(device_path: &str) -> Result<Vec<MountPoint>>
         ));
     }
 
-    let parsed: LsblkOutput = serde_json::from_slice(&output.stdout).context("parsing lsblk JSON")?;
+    let parsed: LsblkOutput =
+        serde_json::from_slice(&output.stdout).context("parsing lsblk JSON")?;
     let mut mountpoints = Vec::new();
 
     if let Some(device) = find_device(&parsed.blockdevices, device_path) {
@@ -311,7 +313,11 @@ mod tests {
             Some("/dev/sda1"),
             None,
             None,
-            Some(vec![Some(String::new()), None, Some("/mnt/usb".to_string())]),
+            Some(vec![
+                Some(String::new()),
+                None,
+                Some("/mnt/usb".to_string()),
+            ]),
             None,
         );
         let mut out = Vec::new();

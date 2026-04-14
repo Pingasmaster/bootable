@@ -6,14 +6,13 @@ mod util;
 mod writer;
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gio::prelude::VolumeMonitorExt;
+use glib::clone;
+use gtk::{gdk, gio, glib};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
 use std::time::Duration;
-use glib::types::StaticType;
-use gio::prelude::VolumeMonitorExt;
 
 use crate::writer::{FileSystem, ImageMode, PartitionScheme, TargetSystem, UiEvent, WritePlan};
 
@@ -22,9 +21,18 @@ fn main() -> glib::ExitCode {
         return helper::run_helper(&plan_path);
     }
 
+    gio::resources_register_include!("bootable.gresource")
+        .expect("registering embedded gresource bundle");
+
     let app = adw::Application::builder()
         .application_id("io.bootable.app")
         .build();
+    app.connect_startup(|_| {
+        if let Some(display) = gdk::Display::default() {
+            let theme = gtk::IconTheme::for_display(&display);
+            theme.add_resource_path("/io/bootable/app/icons");
+        }
+    });
     app.connect_activate(build_ui);
     app.run()
 }
@@ -36,146 +44,178 @@ fn build_ui(app: &adw::Application) {
         .title("Bootable")
         .default_width(820)
         .default_height(620)
+        .icon_name("io.bootable.app")
         .build();
 
-    let header = adw::HeaderBar::builder()
-        .title_widget(&gtk::Label::new(Some("Bootable")))
-        .build();
+    // ---------- Header bar ----------
+    let title = adw::WindowTitle::new("Bootable", "");
+    let header = adw::HeaderBar::builder().title_widget(&title).build();
 
-    let root = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
+    let menu = gio::Menu::new();
+    menu.append(Some("Keyboard Shortcuts"), Some("win.show-shortcuts"));
+    menu.append(Some("About Bootable"), Some("win.show-about"));
+    menu.append(Some("Quit"), Some("app.quit"));
+    let menu_button = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&menu)
+        .primary(true)
+        .tooltip_text("Main menu")
         .build();
+    header.pack_end(&menu_button);
 
-    let grid = gtk::Grid::builder()
-        .row_spacing(8)
-        .column_spacing(12)
-        .hexpand(true)
+    // ---------- Source group ----------
+    let iso_row = adw::EntryRow::builder()
+        .title("Image file")
+        .editable(false)
         .build();
+    let iso_browse_button = build_suffix_button("document-open-symbolic", "Select image");
+    iso_row.add_suffix(&iso_browse_button);
 
-    let device_list = gtk::StringList::new(&[]);
-    let device_dropdown = gtk::DropDown::new(Some(device_list.clone()), None::<&gtk::Expression>);
+    let checksum_row = adw::EntryRow::builder()
+        .title("Checksum (optional)")
+        .build();
+    let checksum_browse_button =
+        build_suffix_button("document-open-symbolic", "Select checksum file");
+    checksum_row.add_suffix(&checksum_browse_button);
+
+    let signature_row = adw::EntryRow::builder()
+        .title("Signature (optional)")
+        .build();
+    let signature_browse_button =
+        build_suffix_button("document-open-symbolic", "Select signature file");
+    signature_row.add_suffix(&signature_browse_button);
+
+    let source_group = adw::PreferencesGroup::builder()
+        .title("Image source")
+        .description("The file to write and optional verification material.")
+        .build();
+    source_group.add(&iso_row);
+    source_group.add(&checksum_row);
+    source_group.add(&signature_row);
+
+    // ---------- Target group ----------
+    let device_model = gtk::StringList::new(&[]);
+    let device_dropdown = gtk::DropDown::new(Some(device_model.clone()), None::<&gtk::Expression>);
     device_dropdown.set_hexpand(true);
-    let refresh_button = gtk::Button::with_label("Refresh");
-    let device_row = gtk::Box::builder().spacing(8).hexpand(true).build();
-    device_row.append(&device_dropdown);
-    device_row.append(&refresh_button);
-    add_row(&grid, 0, "Device", &device_row);
-
-    let iso_entry = gtk::Entry::builder().editable(false).hexpand(true).build();
-    let browse_button = gtk::Button::with_label("Select");
-    let iso_row = gtk::Box::builder().spacing(8).hexpand(true).build();
-    iso_row.append(&iso_entry);
-    iso_row.append(&browse_button);
-    add_row(&grid, 1, "Select the image", &iso_row);
-
-    let mode_list = gtk::StringList::new(&[
-        "Auto (detect)",
-        "ISOHybrid / DD",
-        "Windows (UEFI/BIOS)",
-    ]);
-    let mode_dropdown = gtk::DropDown::new(Some(mode_list), None::<&gtk::Expression>);
-    mode_dropdown.set_selected(0);
-    add_row(&grid, 2, "Image mode", &mode_dropdown);
-
-    let partition_list = gtk::StringList::new(&["GPT", "MBR"]);
-    let partition_dropdown =
-        gtk::DropDown::new(Some(partition_list), None::<&gtk::Expression>);
-    partition_dropdown.set_selected(0);
-    add_row(&grid, 3, "Partition scheme", &partition_dropdown);
-
-    let target_list = gtk::StringList::new(&["UEFI", "BIOS", "UEFI + BIOS"]);
-    let target_dropdown =
-        gtk::DropDown::new(Some(target_list), None::<&gtk::Expression>);
-    target_dropdown.set_selected(0);
-    add_row(&grid, 4, "Target system", &target_dropdown);
-
-    let fs_list = gtk::StringList::new(&["FAT32", "NTFS"]);
-    let fs_dropdown = gtk::DropDown::new(Some(fs_list), None::<&gtk::Expression>);
-    fs_dropdown.set_selected(0);
-    add_row(&grid, 5, "File system", &fs_dropdown);
-
-    let volume_entry = gtk::Entry::builder().text("BOOTABLE").build();
-    add_row(&grid, 6, "Volume label", &volume_entry);
-
-    let secure_toggle = gtk::Switch::builder().active(false).build();
-    let secure_desc = gtk::Label::new(Some("Require signed shim/grub (Secure Boot only)"));
-    secure_desc.set_halign(gtk::Align::Start);
-    let secure_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+    device_dropdown.set_valign(gtk::Align::Center);
+    let device_refresh_button = build_suffix_button("view-refresh-symbolic", "Refresh (F5)");
+    device_refresh_button.set_action_name(Some("win.refresh"));
+    let device_row = adw::ActionRow::builder()
+        .title("Device")
+        .subtitle("Removable USB target")
         .build();
-    secure_row.append(&secure_toggle);
-    secure_row.append(&secure_desc);
-    add_row(&grid, 7, "Secure Boot", &secure_row);
+    device_row.add_suffix(&device_dropdown);
+    device_row.add_suffix(&device_refresh_button);
 
-    let checksum_entry = gtk::Entry::builder()
-        .placeholder_text("SHA256 hash or .sha256 file path")
-        .hexpand(true)
+    let partition_model = gtk::StringList::new(&["GPT", "MBR"]);
+    let partition_row = adw::ComboRow::builder()
+        .title("Partition scheme")
+        .model(&partition_model)
+        .selected(0)
+        .use_subtitle(true)
         .build();
-    let checksum_button = gtk::Button::with_label("Select");
-    let checksum_row = gtk::Box::builder().spacing(8).hexpand(true).build();
-    checksum_row.append(&checksum_entry);
-    checksum_row.append(&checksum_button);
-    add_row(&grid, 8, "Checksum", &checksum_row);
 
-    let signature_entry = gtk::Entry::builder()
-        .placeholder_text("Signature file (.sig)")
-        .hexpand(true)
+    let fs_model = gtk::StringList::new(&["FAT32", "NTFS"]);
+    let fs_row = adw::ComboRow::builder()
+        .title("File system")
+        .model(&fs_model)
+        .selected(0)
+        .use_subtitle(true)
         .build();
-    let signature_button = gtk::Button::with_label("Select");
-    let signature_row = gtk::Box::builder().spacing(8).hexpand(true).build();
-    signature_row.append(&signature_entry);
-    signature_row.append(&signature_button);
-    add_row(&grid, 9, "Signature", &signature_row);
 
-    let verify_toggle = gtk::Switch::builder().active(false).build();
-    let verify_desc = gtk::Label::new(Some("Verify files/device after write"));
-    verify_desc.set_halign(gtk::Align::Start);
-    let verify_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+    let volume_row = adw::EntryRow::builder()
+        .title("Volume label")
+        .text("BOOTABLE")
         .build();
-    verify_row.append(&verify_toggle);
-    verify_row.append(&verify_desc);
-    add_row(&grid, 10, "Verify", &verify_row);
 
-    let persistence_spin = gtk::SpinButton::with_range(0.0, 1_048_576.0, 64.0);
-    persistence_spin.set_value(0.0);
-    let persistence_label_entry = gtk::Entry::builder()
+    let target_group = adw::PreferencesGroup::builder()
+        .title("Target device")
+        .description("Where the image will be written. All data on the device will be erased.")
+        .build();
+    target_group.add(&device_row);
+    target_group.add(&partition_row);
+    target_group.add(&fs_row);
+    target_group.add(&volume_row);
+
+    // ---------- Boot config group ----------
+    let mode_model =
+        gtk::StringList::new(&["Auto (detect)", "ISOHybrid / DD", "Windows (UEFI/BIOS)"]);
+    let mode_row = adw::ComboRow::builder()
+        .title("Image mode")
+        .model(&mode_model)
+        .selected(0)
+        .use_subtitle(true)
+        .build();
+
+    let target_system_model = gtk::StringList::new(&["UEFI", "BIOS", "UEFI + BIOS"]);
+    let target_system_row = adw::ComboRow::builder()
+        .title("Target system")
+        .model(&target_system_model)
+        .selected(0)
+        .use_subtitle(true)
+        .build();
+
+    let secure_row = adw::SwitchRow::builder()
+        .title("Secure Boot")
+        .subtitle("Require signed shim/grub (Windows NTFS + UEFI only)")
+        .active(false)
+        .build();
+
+    let boot_group = adw::PreferencesGroup::builder()
+        .title("Boot configuration")
+        .build();
+    boot_group.add(&mode_row);
+    boot_group.add(&target_system_row);
+    boot_group.add(&secure_row);
+
+    // ---------- Advanced group ----------
+    let persistence_adjustment = gtk::Adjustment::new(0.0, 0.0, 1_048_576.0, 64.0, 512.0, 0.0);
+    let persistence_row = adw::SpinRow::builder()
+        .title("Persistence (MiB)")
+        .subtitle("Live-media persistence partition size. 0 disables.")
+        .adjustment(&persistence_adjustment)
+        .digits(0)
+        .snap_to_ticks(true)
+        .build();
+
+    let persistence_label_row = adw::EntryRow::builder()
+        .title("Persistence label")
         .text("persistence")
-        .placeholder_text("Label (e.g. persistence or casper-rw)")
-        .hexpand(true)
         .build();
-    let persistence_row = gtk::Box::builder().spacing(8).hexpand(true).build();
-    persistence_row.append(&persistence_spin);
-    persistence_row.append(&persistence_label_entry);
-    add_row(&grid, 11, "Persistence (MiB)", &persistence_row);
 
-    let dry_run_toggle = gtk::Switch::builder().active(false).build();
-    let dry_run_desc = gtk::Label::new(Some("Dry run (no writes)"));
-    dry_run_desc.set_halign(gtk::Align::Start);
-    let dry_run_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+    let verify_row = adw::SwitchRow::builder()
+        .title("Verify")
+        .subtitle("Re-read the written data and compare to the source")
+        .active(false)
         .build();
-    dry_run_row.append(&dry_run_toggle);
-    dry_run_row.append(&dry_run_desc);
-    add_row(&grid, 12, "Dry run", &dry_run_row);
 
-    root.append(&grid);
+    let dry_run_row = adw::SwitchRow::builder()
+        .title("Dry run")
+        .subtitle("Plan the operation but don't write anything")
+        .active(false)
+        .build();
 
-    let start_button = gtk::Button::with_label("Start");
-    start_button.set_halign(gtk::Align::End);
-    root.append(&start_button);
+    let advanced_group = adw::PreferencesGroup::builder()
+        .title("Advanced")
+        .description("Live-media persistence, verification, and dry-run.")
+        .build();
+    advanced_group.add(&persistence_row);
+    advanced_group.add(&persistence_label_row);
+    advanced_group.add(&verify_row);
+    advanced_group.add(&dry_run_row);
 
-    let progress = gtk::ProgressBar::builder().show_text(true).build();
-    root.append(&progress);
+    // ---------- Start button ----------
+    let start_button = gtk::Button::builder()
+        .label("Start Write")
+        .halign(gtk::Align::Center)
+        .margin_top(8)
+        .margin_bottom(8)
+        .action_name("win.start")
+        .build();
+    start_button.add_css_class("pill");
+    start_button.add_css_class("suggested-action");
 
+    // ---------- Log view ----------
     let log_view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -183,141 +223,248 @@ fn build_ui(app: &adw::Application) {
         .wrap_mode(gtk::WrapMode::WordChar)
         .build();
     let log_buffer = log_view.buffer();
-    let scroller = gtk::ScrolledWindow::builder()
+    let log_scroller = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
+        .min_content_height(160)
         .child(&log_view)
         .build();
-    root.append(&scroller);
+    log_scroller.add_css_class("card");
 
+    let log_frame = adw::PreferencesGroup::builder()
+        .title("Activity log")
+        .build();
+    log_frame.add(&log_scroller);
+
+    // ---------- StatusPage for empty device list ----------
+    let empty_status = adw::StatusPage::builder()
+        .icon_name("drive-removable-media-symbolic")
+        .title("No removable devices")
+        .description("Plug in a USB drive or memory card to get started.")
+        .vexpand(true)
+        .build();
+    empty_status.add_css_class("compact");
+
+    // ---------- Preferences page ----------
+    let prefs_page = adw::PreferencesPage::new();
+    prefs_page.add(&source_group);
+    prefs_page.add(&target_group);
+    prefs_page.add(&boot_group);
+    prefs_page.add(&advanced_group);
+
+    let start_group = adw::PreferencesGroup::new();
+    start_group.add(&start_button);
+    prefs_page.add(&start_group);
+    prefs_page.add(&log_frame);
+
+    // ---------- Flash-in-progress banner ----------
+    let flash_banner = adw::Banner::builder()
+        .title("Write in progress — device list refresh is paused")
+        .revealed(false)
+        .build();
+
+    // ---------- Content stack (form vs. empty state) ----------
+    let content_stack = gtk::Stack::new();
+    content_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    content_stack.add_named(&prefs_page, Some("form"));
+    content_stack.add_named(&empty_status, Some("empty"));
+    content_stack.set_visible_child_name("form");
+
+    let content_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    content_box.append(&flash_banner);
+    content_box.append(&content_stack);
+
+    // ---------- Toast overlay ----------
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&content_box));
+
+    // ---------- Bottom-bar progress ----------
+    let progress = gtk::ProgressBar::builder()
+        .show_text(true)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let bottom_bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    bottom_bar.append(&progress);
+
+    // ---------- Toolbar view ----------
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&root));
+    toolbar_view.set_content(Some(&toast_overlay));
+    toolbar_view.add_bottom_bar(&bottom_bar);
+
     window.set_content(Some(&toolbar_view));
+
+    // ---------- Adaptive breakpoint ----------
+    let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        500.0,
+        adw::LengthUnit::Sp,
+    ));
+    window.add_breakpoint(breakpoint);
+
     window.present();
 
+    // ---------- Shared state ----------
     let devices_state: Rc<RefCell<Vec<devices::Device>>> = Rc::new(RefCell::new(Vec::new()));
     let flashing: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-    let dialog_open: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
+    // ---------- update_controls closure ----------
     let update_controls: Rc<dyn Fn()> = {
-        let mode_dropdown = mode_dropdown.clone();
-        let partition_dropdown = partition_dropdown.clone();
-        let target_dropdown = target_dropdown.clone();
-        let fs_dropdown = fs_dropdown.clone();
-        let volume_entry = volume_entry.clone();
-        let secure_toggle = secure_toggle.clone();
-        let persistence_spin = persistence_spin.clone();
-        let persistence_label_entry = persistence_label_entry.clone();
+        let mode_row = mode_row.clone();
+        let partition_row = partition_row.clone();
+        let target_system_row = target_system_row.clone();
+        let fs_row = fs_row.clone();
+        let volume_row = volume_row.clone();
+        let secure_row = secure_row.clone();
+        let persistence_row = persistence_row.clone();
+        let persistence_label_row = persistence_label_row.clone();
         Rc::new(move || {
-            let mode = mode_dropdown.selected();
-            let dd_mode = mode == 1;
-            let target = target_dropdown.selected();
-            let fs_idx = fs_dropdown.selected();
+            let dd_mode = mode_row.selected() == 1;
+            let target = target_system_row.selected();
+            let fs_idx = fs_row.selected();
             let uefi_enabled = target != 1;
             let bios_enabled = target != 0;
             let ntfs_selected = fs_idx == 1;
 
             if dd_mode {
-                partition_dropdown.set_sensitive(false);
-                target_dropdown.set_sensitive(false);
-                fs_dropdown.set_sensitive(false);
-                volume_entry.set_sensitive(false);
-                secure_toggle.set_sensitive(false);
-                secure_toggle.set_active(false);
-                persistence_spin.set_sensitive(true);
-                persistence_label_entry.set_sensitive(true);
+                partition_row.set_sensitive(false);
+                target_system_row.set_sensitive(false);
+                fs_row.set_sensitive(false);
+                volume_row.set_sensitive(false);
+                secure_row.set_sensitive(false);
+                secure_row.set_active(false);
+                persistence_row.set_sensitive(true);
+                persistence_label_row.set_sensitive(true);
                 return;
             }
 
-            target_dropdown.set_sensitive(true);
-            fs_dropdown.set_sensitive(true);
-            volume_entry.set_sensitive(true);
-            persistence_spin.set_sensitive(false);
-            persistence_label_entry.set_sensitive(false);
+            target_system_row.set_sensitive(true);
+            fs_row.set_sensitive(true);
+            volume_row.set_sensitive(true);
+            persistence_row.set_sensitive(false);
+            persistence_label_row.set_sensitive(false);
 
             if bios_enabled {
-                if partition_dropdown.selected() != 1 {
-                    partition_dropdown.set_selected(1);
+                if partition_row.selected() != 1 {
+                    partition_row.set_selected(1);
                 }
-                partition_dropdown.set_sensitive(false);
+                partition_row.set_sensitive(false);
             } else {
-                partition_dropdown.set_sensitive(true);
+                partition_row.set_sensitive(true);
             }
 
             let secure_allowed = ntfs_selected && uefi_enabled;
             if !secure_allowed {
-                secure_toggle.set_active(false);
+                secure_row.set_active(false);
             }
-            secure_toggle.set_sensitive(secure_allowed);
+            secure_row.set_sensitive(secure_allowed);
+        })
+    };
+    update_controls();
+
+    {
+        let update = update_controls.clone();
+        mode_row.connect_selected_notify(move |_| update());
+    }
+    {
+        let update = update_controls.clone();
+        target_system_row.connect_selected_notify(move |_| update());
+    }
+    {
+        let update = update_controls.clone();
+        fs_row.connect_selected_notify(move |_| update());
+    }
+
+    // ---------- Device list refresh ----------
+    let update_stack_visibility: Rc<dyn Fn()> = {
+        let devices_state = devices_state.clone();
+        Rc::new(move || {
+            let name = if devices_state.borrow().is_empty() {
+                "empty"
+            } else {
+                "form"
+            };
+            content_stack.set_visible_child_name(name);
         })
     };
 
-    update_controls();
-
-    let update_controls_clone = update_controls.clone();
-    mode_dropdown.connect_selected_notify(move |_| {
-        update_controls_clone();
-    });
-    let update_controls_clone = update_controls.clone();
-    target_dropdown.connect_selected_notify(move |_| {
-        update_controls_clone();
-    });
-    let update_controls_clone = update_controls.clone();
-    fs_dropdown.connect_selected_notify(move |_| {
-        update_controls_clone();
-    });
-
-    refresh_devices_guarded(
-        &device_list,
-        &devices_state,
-        &log_buffer,
-        &flashing,
-        &device_dropdown,
-        false,
-    );
-
-    let device_list_clone = device_list.clone();
-    let devices_state_clone = devices_state.clone();
-    let log_buffer_clone = log_buffer.clone();
-    let flashing_clone = flashing.clone();
-    let device_dropdown_clone = device_dropdown.clone();
-    refresh_button.connect_clicked(move |_| {
-        refresh_devices_guarded(
-            &device_list_clone,
-            &devices_state_clone,
-            &log_buffer_clone,
-            &flashing_clone,
-            &device_dropdown_clone,
-            true,
-        );
-    });
-
-    let refresh_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    let schedule_refresh: Rc<dyn Fn()> = {
+    let refresh_devices: Rc<dyn Fn(bool, bool)> = {
         let devices_state = devices_state.clone();
         let log_buffer = log_buffer.clone();
-        let flashing = flashing.clone();
         let device_dropdown = device_dropdown.clone();
+        let flashing = flashing.clone();
+        let toast_overlay = toast_overlay.clone();
+        Rc::new(move |manual: bool, log_when_skipped: bool| {
+            if *flashing.borrow() {
+                if log_when_skipped {
+                    append_log(&log_buffer, "Flash in progress; device refresh skipped");
+                }
+                return;
+            }
+            let previous_path = {
+                let devices = devices_state.borrow();
+                let selected = device_dropdown.selected() as usize;
+                devices.get(selected).map(|dev| dev.path.clone())
+            };
+            match devices::list_removable() {
+                Ok(list) => {
+                    devices_state.borrow_mut().clear();
+                    devices_state.borrow_mut().extend(list);
+                    let count = device_model.n_items();
+                    if count > 0 {
+                        device_model.splice(0, count, &[]);
+                    }
+                    for dev in devices_state.borrow().iter() {
+                        device_model.append(&dev.display);
+                    }
+                    if let Some(path) = previous_path {
+                        if let Some(idx) = devices_state
+                            .borrow()
+                            .iter()
+                            .position(|dev| dev.path == path)
+                        {
+                            device_dropdown.set_selected(
+                                u32::try_from(idx).unwrap_or(gtk::INVALID_LIST_POSITION),
+                            );
+                        } else {
+                            device_dropdown.set_selected(gtk::INVALID_LIST_POSITION);
+                        }
+                    } else if device_model.n_items() == 0 {
+                        device_dropdown.set_selected(gtk::INVALID_LIST_POSITION);
+                    }
+                    update_stack_visibility();
+                    if manual {
+                        toast_overlay.add_toast(adw::Toast::new("Device list refreshed"));
+                    }
+                }
+                Err(err) => {
+                    append_log(&log_buffer, &format!("Device scan failed: {err}"));
+                    toast_overlay.add_toast(adw::Toast::new("Device scan failed"));
+                }
+            }
+        })
+    };
+    refresh_devices(false, false);
+
+    // ---------- Volume monitor (debounced) ----------
+    let refresh_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let schedule_refresh: Rc<dyn Fn()> = {
+        let refresh_devices = refresh_devices.clone();
         Rc::new(move || {
             if let Some(id) = refresh_timer.borrow_mut().take() {
                 id.remove();
             }
-            let device_list = device_list.clone();
-            let devices_state = devices_state.clone();
-            let log_buffer = log_buffer.clone();
+            let refresh_devices = refresh_devices.clone();
             let refresh_timer_for_cb = refresh_timer.clone();
-            let flashing = flashing.clone();
-            let device_dropdown = device_dropdown.clone();
             let id = glib::timeout_add_local_once(Duration::from_millis(400), move || {
-                refresh_devices_guarded(
-                    &device_list,
-                    &devices_state,
-                    &log_buffer,
-                    &flashing,
-                    &device_dropdown,
-                    false,
-                );
+                refresh_devices(false, false);
                 refresh_timer_for_cb.borrow_mut().take();
             });
             *refresh_timer.borrow_mut() = Some(id);
@@ -325,286 +472,226 @@ fn build_ui(app: &adw::Application) {
     };
 
     let monitor = gio::VolumeMonitor::get();
-    {
-        let schedule_refresh = schedule_refresh.clone();
-        monitor.connect_drive_connected(move |_, _| {
-            schedule_refresh();
-        });
-    }
-    {
-        let schedule_refresh = schedule_refresh.clone();
-        monitor.connect_drive_disconnected(move |_, _| {
-            schedule_refresh();
-        });
-    }
-    {
-        let schedule_refresh = schedule_refresh.clone();
-        monitor.connect_volume_added(move |_, _| {
-            schedule_refresh();
-        });
-    }
-    {
-        let schedule_refresh = schedule_refresh.clone();
-        monitor.connect_volume_removed(move |_, _| {
-            schedule_refresh();
-        });
-    }
-    {
-        let schedule_refresh = schedule_refresh.clone();
-        monitor.connect_mount_added(move |_, _| {
-            schedule_refresh();
-        });
-    }
-    {
-        let schedule_refresh = schedule_refresh.clone();
-        monitor.connect_mount_removed(move |_, _| {
-            schedule_refresh();
-        });
+    for wire in [
+        wire_monitor_drive_connected as fn(&gio::VolumeMonitor, Rc<dyn Fn()>),
+        wire_monitor_drive_disconnected,
+        wire_monitor_volume_added,
+        wire_monitor_volume_removed,
+        wire_monitor_mount_added,
+        wire_monitor_mount_removed,
+    ] {
+        wire(&monitor, schedule_refresh.clone());
     }
 
-    let window_clone = window.clone();
-    let iso_entry_clone = iso_entry.clone();
-    browse_button.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::builder()
-            .title("Select image")
-            .modal(true)
-            .build();
-        let image_filter = gtk::FileFilter::new();
-        image_filter.set_name(Some("Disk images"));
-        image_filter.add_pattern("*.iso");
-        image_filter.add_pattern("*.img");
-        image_filter.add_pattern("*.raw");
-        image_filter.add_pattern("*.bin");
-        let all_filter = gtk::FileFilter::new();
-        all_filter.set_name(Some("All files"));
-        all_filter.add_pattern("*");
-        let filters = gio::ListStore::builder()
-            .item_type(gtk::FileFilter::static_type())
-            .build();
-        filters.append(&image_filter);
-        filters.append(&all_filter);
-        dialog.set_filters(Some(&filters));
-        dialog.set_default_filter(Some(&image_filter));
-        let entry = iso_entry_clone.clone();
-        dialog.open(Some(&window_clone), None::<&gio::Cancellable>, move |result| {
-            if let Ok(file) = result
-                && let Some(path) = file.path()
-            {
-                entry.set_text(path.to_string_lossy().as_ref());
-            }
-        });
-    });
+    // ---------- async-channel wiring ----------
+    let (sender, receiver) = async_channel::unbounded::<UiEvent>();
 
-    let window_clone = window.clone();
-    let checksum_entry_clone = checksum_entry.clone();
-    checksum_button.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::builder()
-            .title("Select checksum file")
-            .modal(true)
-            .build();
-        let entry = checksum_entry_clone.clone();
-        dialog.open(Some(&window_clone), None::<&gio::Cancellable>, move |result| {
-            if let Ok(file) = result
-                && let Some(path) = file.path()
-            {
-                entry.set_text(path.to_string_lossy().as_ref());
-            }
-        });
-    });
-
-    let window_clone = window.clone();
-    let signature_entry_clone = signature_entry.clone();
-    signature_button.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::builder()
-            .title("Select signature file")
-            .modal(true)
-            .build();
-        let entry = signature_entry_clone.clone();
-        dialog.open(Some(&window_clone), None::<&gio::Cancellable>, move |result| {
-            if let Ok(file) = result
-                && let Some(path) = file.path()
-            {
-                entry.set_text(path.to_string_lossy().as_ref());
-            }
-        });
-    });
-
-    let (sender, receiver) = mpsc::channel::<UiEvent>();
-
-    let controls: Vec<gtk::Widget> = vec![
-        device_dropdown.clone().upcast(),
-        refresh_button.upcast(),
-        browse_button.upcast(),
-        iso_entry.clone().upcast(),
-        mode_dropdown.clone().upcast(),
-        partition_dropdown.clone().upcast(),
-        target_dropdown.clone().upcast(),
-        fs_dropdown.clone().upcast(),
-        volume_entry.clone().upcast(),
-        secure_toggle.clone().upcast(),
-        checksum_entry.clone().upcast(),
-        checksum_button.upcast(),
-        signature_entry.clone().upcast(),
-        signature_button.upcast(),
-        verify_toggle.clone().upcast(),
-        persistence_spin.clone().upcast(),
-        persistence_label_entry.clone().upcast(),
-        dry_run_toggle.clone().upcast(),
-        start_button.clone().upcast(),
-    ];
-
-    let progress_clone = progress.clone();
-    let log_buffer_receiver = log_buffer.clone();
-    let controls_receiver = controls.clone();
-    let flashing_receiver = flashing.clone();
-    let update_controls_receiver = update_controls.clone();
-
-    glib::idle_add_local(move || {
-        loop {
-            match receiver.try_recv() {
-                Ok(event) => match event {
-                    UiEvent::Log(msg) => append_log(&log_buffer_receiver, &msg),
+    glib::spawn_future_local(clone!(
+        #[strong]
+        progress,
+        #[strong]
+        log_buffer,
+        #[strong]
+        flashing,
+        #[strong]
+        flash_banner,
+        #[strong]
+        source_group,
+        #[strong]
+        target_group,
+        #[strong]
+        boot_group,
+        #[strong]
+        advanced_group,
+        #[strong]
+        start_button,
+        #[strong]
+        update_controls,
+        #[strong]
+        toast_overlay,
+        async move {
+            while let Ok(event) = receiver.recv().await {
+                match event {
+                    UiEvent::Log(msg) => append_log(&log_buffer, &msg),
                     UiEvent::Progress(frac) => {
-                        progress_clone.set_fraction(frac);
-                        progress_clone.set_text(Some(&format!("{:.0}%", frac * 100.0)));
+                        progress.set_fraction(frac);
+                        progress.set_text(Some(&format!("{:.0}%", frac * 100.0)));
                     }
                     UiEvent::Done(result) => {
                         match result {
-                            Ok(()) => append_log(&log_buffer_receiver, "Completed successfully"),
-                            Err(err) => append_log(&log_buffer_receiver, &format!("Error: {err}")),
+                            Ok(()) => {
+                                append_log(&log_buffer, "Completed successfully");
+                                toast_overlay.add_toast(adw::Toast::new("Write completed"));
+                            }
+                            Err(err) => {
+                                append_log(&log_buffer, &format!("Error: {err}"));
+                                toast_overlay.add_toast(adw::Toast::new("Write failed — see log"));
+                            }
                         }
-                        *flashing_receiver.borrow_mut() = false;
-                        set_controls_sensitive(&controls_receiver, true);
-                        update_controls_receiver();
+                        *flashing.borrow_mut() = false;
+                        flash_banner.set_revealed(false);
+                        set_groups_sensitive(
+                            &[&source_group, &target_group, &boot_group, &advanced_group],
+                            true,
+                        );
+                        start_button.set_sensitive(true);
+                        update_controls();
                     }
-                },
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return glib::ControlFlow::Break;
                 }
             }
         }
-        glib::ControlFlow::Continue
-    });
+    ));
 
-    start_button.connect_clicked(move |_| {
-        if *dialog_open.borrow() {
-            return;
-        }
-        let iso_text = iso_entry.text().to_string();
-        if iso_text.trim().is_empty() {
-            append_log(&log_buffer, "Select an image first");
-            return;
-        }
+    // ---------- File pickers ----------
+    {
+        let window = window.clone();
+        let iso_row = iso_row.clone();
+        iso_browse_button.connect_clicked(move |_| {
+            pick_image_file(&window, &iso_row);
+        });
+    }
+    {
+        let window = window.clone();
+        let checksum_row = checksum_row.clone();
+        checksum_browse_button.connect_clicked(move |_| {
+            pick_plain_file(&window, &checksum_row, "Select checksum file");
+        });
+    }
+    {
+        let window = window.clone();
+        let signature_row = signature_row.clone();
+        signature_browse_button.connect_clicked(move |_| {
+            pick_plain_file(&window, &signature_row, "Select signature file");
+        });
+    }
 
-        let iso_path = PathBuf::from(iso_text);
-        let selected = device_dropdown.selected() as usize;
-        let devices = devices_state.borrow();
-        let Some(device) = devices.get(selected) else {
-            append_log(&log_buffer, "Select a target device");
-            return;
-        };
+    // ---------- Actions ----------
+    let refresh_action = gio::ActionEntry::builder("refresh")
+        .activate(clone!(
+            #[strong]
+            refresh_devices,
+            move |_: &adw::ApplicationWindow, _, _| {
+                refresh_devices(true, true);
+            }
+        ))
+        .build();
 
-        let mountpoints = match devices::mountpoints_for_device(&device.path) {
-            Ok(points) => points,
-            Err(err) => {
-                append_log(&log_buffer, &format!("Failed to read mountpoints: {err}"));
+    let select_image_action = gio::ActionEntry::builder("select-image")
+        .activate(clone!(
+            #[strong]
+            iso_row,
+            move |w: &adw::ApplicationWindow, _, _| {
+                pick_image_file(w, &iso_row);
+            }
+        ))
+        .build();
+
+    let show_about_action = gio::ActionEntry::builder("show-about")
+        .activate(|w: &adw::ApplicationWindow, _, _| {
+            show_about_dialog(w);
+        })
+        .build();
+
+    let show_shortcuts_action = gio::ActionEntry::builder("show-shortcuts")
+        .activate(|w: &adw::ApplicationWindow, _, _| {
+            show_shortcuts_dialog(w);
+        })
+        .build();
+
+    let start_action_cb =
+        move |win: &adw::ApplicationWindow, _: &gio::SimpleAction, _: Option<&glib::Variant>| {
+            let iso_text = iso_row.text().to_string();
+            if iso_text.trim().is_empty() {
+                toast_overlay.add_toast(adw::Toast::new("Select an image first"));
                 return;
             }
-        };
 
-        if let Some(reason) = system_mount_block(&mountpoints) {
-            append_log(
-                &log_buffer,
-                &format!(
-                    "Refusing to write: {device_path} is mounted on {reason}",
-                    device_path = &device.path,
-                    reason = reason
-                ),
-            );
-            return;
-        }
+            let iso_path = PathBuf::from(iso_text);
+            let selected = device_dropdown.selected() as usize;
+            let devices = devices_state.borrow();
+            let Some(device) = devices.get(selected) else {
+                toast_overlay.add_toast(adw::Toast::new("Select a target device"));
+                return;
+            };
+            let device = device.clone();
+            drop(devices);
 
-        let dry_run = dry_run_toggle.is_active();
-        if !dry_run && !util::is_root() && !util::command_exists("pkexec") {
-            append_log(&log_buffer, "pkexec not found; install polkit to enable admin writes.");
-            return;
-        }
+            let mountpoints = match devices::mountpoints_for_device(&device.path) {
+                Ok(points) => points,
+                Err(err) => {
+                    append_log(&log_buffer, &format!("Failed to read mountpoints: {err}"));
+                    return;
+                }
+            };
 
-        let image_mode = match mode_dropdown.selected() {
-            0 => ImageMode::Auto,
-            1 => ImageMode::IsoHybridDd,
-            _ => ImageMode::WindowsUefi,
-        };
-
-        let partition_scheme = match partition_dropdown.selected() {
-            0 => PartitionScheme::Gpt,
-            _ => PartitionScheme::Mbr,
-        };
-
-        let target_system = match target_dropdown.selected() {
-            0 => TargetSystem::Uefi,
-            1 => TargetSystem::Bios,
-            _ => TargetSystem::UefiAndBios,
-        };
-
-        let file_system = if fs_dropdown.selected() == 1 {
-            FileSystem::Ntfs
-        } else {
-            FileSystem::Fat32
-        };
-
-        let checksum_value = {
-            let text = checksum_entry.text().trim().to_string();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
+            if let Some(reason) = system_mount_block(&mountpoints) {
+                append_log(
+                    &log_buffer,
+                    &format!(
+                        "Refusing to write: {device_path} is mounted on {reason}",
+                        device_path = &device.path,
+                    ),
+                );
+                toast_overlay.add_toast(adw::Toast::new("Target is mounted on a system path"));
+                return;
             }
-        };
-        let signature_path = {
-            let text = signature_entry.text().trim().to_string();
-            if text.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(text))
+
+            let dry_run = dry_run_row.is_active();
+            if !dry_run && !util::is_root() && !util::command_exists("pkexec") {
+                append_log(
+                    &log_buffer,
+                    "pkexec not found; install polkit to enable admin writes.",
+                );
+                return;
             }
-        };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let persistence_size_mib = persistence_spin.value() as u64;
-        let persistence_label = persistence_label_entry.text().to_string();
 
-        let plan = WritePlan {
-            iso_path,
-            device_path: device.path.clone(),
-            device_size_bytes: device.size_bytes,
-            image_mode,
-            partition_scheme,
-            target_system,
-            file_system,
-            volume_label: volume_entry.text().to_string(),
-            secure_boot_only: secure_toggle.is_active(),
-            verify_after: verify_toggle.is_active(),
-            checksum_sha256: checksum_value,
-            signature_path,
-            persistence_size_mib,
-            persistence_label,
-            dry_run,
-        };
+            let plan = WritePlan {
+                iso_path,
+                device_path: device.path.clone(),
+                device_size_bytes: device.size_bytes,
+                image_mode: match mode_row.selected() {
+                    0 => ImageMode::Auto,
+                    1 => ImageMode::IsoHybridDd,
+                    _ => ImageMode::WindowsUefi,
+                },
+                partition_scheme: match partition_row.selected() {
+                    0 => PartitionScheme::Gpt,
+                    _ => PartitionScheme::Mbr,
+                },
+                target_system: match target_system_row.selected() {
+                    0 => TargetSystem::Uefi,
+                    1 => TargetSystem::Bios,
+                    _ => TargetSystem::UefiAndBios,
+                },
+                file_system: if fs_row.selected() == 1 {
+                    FileSystem::Ntfs
+                } else {
+                    FileSystem::Fat32
+                },
+                volume_label: volume_row.text().to_string(),
+                secure_boot_only: secure_row.is_active(),
+                verify_after: verify_row.is_active(),
+                checksum_sha256: non_empty_text(checksum_row.text().as_str()),
+                signature_path: non_empty_text(signature_row.text().as_str()).map(PathBuf::from),
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                persistence_size_mib: persistence_row.value() as u64,
+                persistence_label: persistence_label_row.text().to_string(),
+                dry_run,
+            };
 
-        let sender = sender.clone();
-        let controls = controls.clone();
-        let progress = progress.clone();
-        let log_buffer = log_buffer.clone();
-        let flashing = flashing.clone();
+            let sender = sender.clone();
+            let log_buffer = log_buffer.clone();
+            let flashing = flashing.clone();
+            let flash_banner = flash_banner.clone();
+            let source_group = source_group.clone();
+            let target_group = target_group.clone();
+            let boot_group = boot_group.clone();
+            let advanced_group = advanced_group.clone();
+            let start_button = start_button.clone();
+            let progress = progress.clone();
+            let toast_overlay_inner = toast_overlay.clone();
 
-        *dialog_open.borrow_mut() = true;
-        let dialog_open_close = dialog_open.clone();
-        show_confirmation_dialog(
-            &window,
-            device,
-            &mountpoints,
-            move || {
+            show_confirm_dialog(win, &device, &mountpoints, move || {
                 append_log(
                     &log_buffer,
                     &format!(
@@ -612,30 +699,37 @@ fn build_ui(app: &adw::Application) {
                         device_path = plan.device_path.as_str()
                     ),
                 );
-                if !util::is_root() && !dry_run {
+                toast_overlay_inner.add_toast(adw::Toast::new("Write started"));
+                if !util::is_root() && !plan.dry_run {
                     append_log(&log_buffer, "Requesting admin access (pkexec)...");
                 }
                 progress.set_fraction(0.0);
                 progress.set_text(Some("0%"));
-                set_controls_sensitive(&controls, false);
+                set_groups_sensitive(
+                    &[&source_group, &target_group, &boot_group, &advanced_group],
+                    false,
+                );
+                start_button.set_sensitive(false);
                 *flashing.borrow_mut() = true;
+                flash_banner.set_revealed(true);
 
                 let sender = sender.clone();
                 let sender_panic = sender.clone();
+                let dry_run = plan.dry_run;
                 std::thread::spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if util::is_root() || dry_run {
                             let sender = sender.clone();
                             writer::run(&plan, move |event| {
-                                let _ = sender.send(event);
+                                let _ = sender.send_blocking(event);
                             });
                         } else {
                             let sender_events = sender.clone();
                             let result = helper::run_helper_with_pkexec(&plan, move |event| {
-                                let _ = sender_events.send(event);
+                                let _ = sender_events.send_blocking(event);
                             });
                             if let Err(err) = result {
-                                let _ = sender.send(UiEvent::Done(Err(err.to_string())));
+                                let _ = sender.send_blocking(UiEvent::Done(Err(err)));
                             }
                         }
                     }));
@@ -645,23 +739,54 @@ fn build_ui(app: &adw::Application) {
                             .map(|s| (*s).to_string())
                             .or_else(|| payload.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "unknown panic".to_string());
-                        let _ = sender_panic.send(UiEvent::Done(Err(format!(
+                        let _ = sender_panic.send_blocking(UiEvent::Done(Err(anyhow::anyhow!(
                             "Write worker panicked: {msg}"
                         ))));
                     }
                 });
-            },
-            move || *dialog_open_close.borrow_mut() = false,
-        );
-    });
+            });
+        };
+    let start_action = gio::ActionEntry::builder("start")
+        .activate(start_action_cb)
+        .build();
+
+    window.add_action_entries([
+        refresh_action,
+        select_image_action,
+        show_about_action,
+        show_shortcuts_action,
+        start_action,
+    ]);
+
+    let quit_action = gio::ActionEntry::builder("quit")
+        .activate(|app: &adw::Application, _, _| app.quit())
+        .build();
+    app.add_action_entries([quit_action]);
+
+    app.set_accels_for_action("win.refresh", &["F5"]);
+    app.set_accels_for_action("win.select-image", &["<Ctrl>o"]);
+    app.set_accels_for_action("win.show-about", &["<Ctrl>i"]);
+    app.set_accels_for_action("win.show-shortcuts", &["<Ctrl>question"]);
+    app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
 }
 
-fn add_row(grid: &gtk::Grid, row: i32, label: &str, widget: &impl IsA<gtk::Widget>) {
-    let lbl = gtk::Label::new(Some(label));
-    lbl.set_halign(gtk::Align::Start);
-    lbl.set_valign(gtk::Align::Center);
-    grid.attach(&lbl, 0, row, 1, 1);
-    grid.attach(widget, 1, row, 1, 1);
+// ---------- Helpers ----------
+
+fn build_suffix_button(icon: &str, tooltip: &str) -> gtk::Button {
+    let b = gtk::Button::from_icon_name(icon);
+    b.set_valign(gtk::Align::Center);
+    b.set_tooltip_text(Some(tooltip));
+    b.add_css_class("flat");
+    b
+}
+
+fn non_empty_text(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn append_log(buffer: &gtk::TextBuffer, msg: &str) {
@@ -670,68 +795,183 @@ fn append_log(buffer: &gtk::TextBuffer, msg: &str) {
     buffer.insert(&mut end, "\n");
 }
 
-fn set_controls_sensitive(controls: &[gtk::Widget], sensitive: bool) {
-    for widget in controls {
-        widget.set_sensitive(sensitive);
+fn set_groups_sensitive(groups: &[&adw::PreferencesGroup], sensitive: bool) {
+    for group in groups {
+        group.set_sensitive(sensitive);
     }
 }
 
-fn refresh_devices_guarded(
-    device_list: &gtk::StringList,
-    devices_state: &Rc<RefCell<Vec<devices::Device>>>,
-    log_buffer: &gtk::TextBuffer,
-    flashing: &Rc<RefCell<bool>>,
-    device_dropdown: &gtk::DropDown,
-    log_when_skipped: bool,
-) {
-    if *flashing.borrow() {
-        if log_when_skipped {
-            append_log(log_buffer, "Flash in progress; device refresh skipped");
+fn pick_image_file(window: &adw::ApplicationWindow, row: &adw::EntryRow) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Select image")
+        .modal(true)
+        .build();
+    let image_filter = gtk::FileFilter::new();
+    image_filter.set_name(Some("Disk images"));
+    for pat in ["*.iso", "*.img", "*.raw", "*.bin"] {
+        image_filter.add_pattern(pat);
+    }
+    let all_filter = gtk::FileFilter::new();
+    all_filter.set_name(Some("All files"));
+    all_filter.add_pattern("*");
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&image_filter);
+    filters.append(&all_filter);
+    dialog.set_filters(Some(&filters));
+    dialog.set_default_filter(Some(&image_filter));
+    let row = row.clone();
+    dialog.open(Some(window), None::<&gio::Cancellable>, move |result| {
+        if let Ok(file) = result
+            && let Some(path) = file.path()
+        {
+            row.set_text(path.to_string_lossy().as_ref());
         }
-        return;
-    }
-    refresh_devices(device_list, devices_state, log_buffer, device_dropdown);
+    });
 }
 
-fn refresh_devices(
-    device_list: &gtk::StringList,
-    devices_state: &Rc<RefCell<Vec<devices::Device>>>,
-    log_buffer: &gtk::TextBuffer,
-    device_dropdown: &gtk::DropDown,
+fn pick_plain_file(window: &adw::ApplicationWindow, row: &adw::EntryRow, title: &str) {
+    let dialog = gtk::FileDialog::builder().title(title).modal(true).build();
+    let row = row.clone();
+    dialog.open(Some(window), None::<&gio::Cancellable>, move |result| {
+        if let Ok(file) = result
+            && let Some(path) = file.path()
+        {
+            row.set_text(path.to_string_lossy().as_ref());
+        }
+    });
+}
+
+fn show_confirm_dialog(
+    window: &adw::ApplicationWindow,
+    device: &devices::Device,
+    mountpoints: &[String],
+    on_confirm: impl FnOnce() + 'static,
 ) {
-    let previous_path = {
-        let devices = devices_state.borrow();
-        let selected = device_dropdown.selected() as usize;
-        devices.get(selected).map(|dev| dev.path.clone())
+    let body = if mountpoints.is_empty() {
+        format!(
+            "You are about to erase {display}.\nThis action cannot be undone.",
+            display = device.display
+        )
+    } else {
+        format!(
+            "You are about to erase {display}.\nThis action cannot be undone.\n\nCurrently mounted: {mounts}",
+            display = device.display,
+            mounts = mountpoints.join(", ")
+        )
     };
 
-    match devices::list_removable() {
-        Ok(list) => {
-            devices_state.borrow_mut().clear();
-            devices_state.borrow_mut().extend(list);
-            let count = device_list.n_items();
-            if count > 0 {
-                device_list.splice(0, count, &[]);
-            }
-            for dev in devices_state.borrow().iter() {
-                device_list.append(&dev.display);
-            }
-            if let Some(path) = previous_path {
-                if let Some(idx) = devices_state.borrow().iter().position(|dev| dev.path == path) {
-                    device_dropdown.set_selected(u32::try_from(idx).unwrap_or(gtk::INVALID_LIST_POSITION));
-                } else {
-                    device_dropdown.set_selected(gtk::INVALID_LIST_POSITION);
-                }
-            } else if device_list.n_items() == 0 {
-                device_dropdown.set_selected(gtk::INVALID_LIST_POSITION);
-            }
-            append_log(log_buffer, "Device list refreshed");
+    let dialog = adw::AlertDialog::builder()
+        .heading("Confirm erase")
+        .body(&body)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("erase", "Erase");
+    dialog.set_response_appearance("erase", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let extra = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+
+    let prompt = gtk::Label::new(Some(&format!(
+        "Type {path} to confirm:",
+        path = device.path
+    )));
+    prompt.set_halign(gtk::Align::Start);
+    prompt.set_wrap(true);
+    extra.append(&prompt);
+
+    let confirm_entry = gtk::Entry::builder().placeholder_text(&device.path).build();
+    extra.append(&confirm_entry);
+
+    let confirm_check = gtk::CheckButton::with_label("I understand this will erase all data");
+    extra.append(&confirm_check);
+
+    let error_label = gtk::Label::new(None);
+    error_label.set_halign(gtk::Align::Start);
+    error_label.add_css_class("error");
+    extra.append(&error_label);
+
+    dialog.set_extra_child(Some(&extra));
+
+    let on_confirm = Rc::new(RefCell::new(Some(on_confirm)));
+    let device_path = device.path.clone();
+    dialog.connect_response(None, move |d, response| {
+        if response != "erase" {
+            return;
         }
-        Err(err) => {
-            append_log(log_buffer, &format!("Device scan failed: {err}"));
+        let typed = confirm_entry.text().to_string();
+        if typed.trim() != device_path {
+            error_label.set_text("Device path does not match.");
+            return;
         }
-    }
+        if !confirm_check.is_active() {
+            error_label.set_text("Please confirm the data loss checkbox.");
+            return;
+        }
+        d.close();
+        if let Some(cb) = on_confirm.borrow_mut().take() {
+            cb();
+        }
+    });
+
+    dialog.present(Some(window));
 }
+
+fn show_about_dialog(window: &adw::ApplicationWindow) {
+    let dialog = adw::AboutDialog::builder()
+        .application_name("Bootable")
+        .application_icon("io.bootable.app")
+        .version(env!("CARGO_PKG_VERSION"))
+        .license_type(gtk::License::Gpl30Only)
+        .website("https://github.com/Pingasmaster/bootable")
+        .issue_url("https://github.com/Pingasmaster/bootable/issues")
+        .developer_name("Bootable contributors")
+        .build();
+    dialog.present(Some(window));
+}
+
+fn show_shortcuts_dialog(window: &adw::ApplicationWindow) {
+    let body = "\
+F5\t\tRefresh device list
+Ctrl+O\t\tSelect image
+Ctrl+I\t\tAbout Bootable
+Ctrl+?\t\tThis dialog
+Ctrl+Q\t\tQuit";
+    let dialog = adw::AlertDialog::builder()
+        .heading("Keyboard shortcuts")
+        .body(body)
+        .build();
+    dialog.add_response("ok", "Close");
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("ok");
+    dialog.present(Some(window));
+}
+
+// ---------- Volume monitor wires (factored out so the loop above is typed) ----------
+
+fn wire_monitor_drive_connected(monitor: &gio::VolumeMonitor, schedule: Rc<dyn Fn()>) {
+    monitor.connect_drive_connected(move |_, _| schedule());
+}
+fn wire_monitor_drive_disconnected(monitor: &gio::VolumeMonitor, schedule: Rc<dyn Fn()>) {
+    monitor.connect_drive_disconnected(move |_, _| schedule());
+}
+fn wire_monitor_volume_added(monitor: &gio::VolumeMonitor, schedule: Rc<dyn Fn()>) {
+    monitor.connect_volume_added(move |_, _| schedule());
+}
+fn wire_monitor_volume_removed(monitor: &gio::VolumeMonitor, schedule: Rc<dyn Fn()>) {
+    monitor.connect_volume_removed(move |_, _| schedule());
+}
+fn wire_monitor_mount_added(monitor: &gio::VolumeMonitor, schedule: Rc<dyn Fn()>) {
+    monitor.connect_mount_added(move |_, _| schedule());
+}
+fn wire_monitor_mount_removed(monitor: &gio::VolumeMonitor, schedule: Rc<dyn Fn()>) {
+    monitor.connect_mount_removed(move |_, _| schedule());
+}
+
+// ---------- System-mount block helpers ----------
 
 fn system_mount_block(mountpoints: &[String]) -> Option<String> {
     let allowed_prefixes = ["/mnt/", "/media/", "/run/media/"];
@@ -744,114 +984,6 @@ fn system_mount_block(mountpoints: &[String]) -> Option<String> {
         }
     }
     None
-}
-
-fn show_confirmation_dialog(
-    window: &adw::ApplicationWindow,
-    device: &devices::Device,
-    mountpoints: &[String],
-    on_confirm: impl FnOnce() + 'static,
-    on_close: impl Fn() + 'static,
-) {
-    let dialog = gtk::Window::builder()
-        .transient_for(window)
-        .modal(true)
-        .title("Confirm erase")
-        .default_width(480)
-        .resizable(false)
-        .build();
-
-    let container = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(16)
-        .margin_bottom(16)
-        .margin_start(16)
-        .margin_end(16)
-        .build();
-
-    let warning = gtk::Label::new(Some(&format!(
-        "You are about to erase {device_display}.\nThis action cannot be undone.",
-        device_display = &device.display
-    )));
-    warning.set_wrap(true);
-    warning.set_halign(gtk::Align::Start);
-    container.append(&warning);
-
-    if !mountpoints.is_empty() {
-        let mounts_text = mountpoints.join(", ");
-        let mounts = gtk::Label::new(Some(&format!(
-            "Currently mounted: {mounts_text}"
-        )));
-        mounts.set_wrap(true);
-        mounts.set_halign(gtk::Align::Start);
-        container.append(&mounts);
-    }
-
-    let prompt = gtk::Label::new(Some(&format!(
-        "Type {device_path} to confirm:",
-        device_path = &device.path
-    )));
-    prompt.set_halign(gtk::Align::Start);
-    container.append(&prompt);
-
-    let confirm_entry = gtk::Entry::builder()
-        .placeholder_text(&device.path)
-        .build();
-    container.append(&confirm_entry);
-
-    let confirm_check = gtk::CheckButton::with_label("I understand this will erase all data");
-    container.append(&confirm_check);
-
-    let error_label = gtk::Label::new(None);
-    error_label.set_halign(gtk::Align::Start);
-    container.append(&error_label);
-
-    let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
-
-    let cancel_button = gtk::Button::with_label("Cancel");
-    let erase_button = gtk::Button::with_label("Erase");
-    erase_button.add_css_class("destructive-action");
-    buttons.append(&cancel_button);
-    buttons.append(&erase_button);
-    container.append(&buttons);
-
-    dialog.set_child(Some(&container));
-    dialog.connect_close_request(move |_| {
-        on_close();
-        glib::Propagation::Proceed
-    });
-    dialog.present();
-
-    let dialog_for_cancel = dialog.clone();
-    cancel_button.connect_clicked(move |_| {
-        dialog_for_cancel.close();
-    });
-
-    let on_confirm = Rc::new(RefCell::new(Some(on_confirm)));
-    let dialog_for_erase = dialog;
-    let error_label = error_label;
-    let device_path = device.path.clone();
-    erase_button.connect_clicked(move |_| {
-        let typed = confirm_entry.text().to_string();
-        if typed.trim() != device_path {
-            error_label.set_text("Device path does not match.");
-            return;
-        }
-        if !confirm_check.is_active() {
-            error_label.set_text("Please confirm the data loss checkbox.");
-            return;
-        }
-
-        dialog_for_erase.close();
-        if let Some(cb) = on_confirm.borrow_mut().take() {
-            cb();
-        }
-    });
 }
 
 #[cfg(test)]
@@ -908,11 +1040,35 @@ mod tests {
 
     #[test]
     fn system_mount_block_all_protected() {
-        for path in ["/", "/boot", "/boot/efi", "/home", "/usr", "/var",
-                     "/root", "/etc", "/opt", "/srv", "/run", "/tmp",
-                     "/proc", "/sys", "/dev", "/snap", "/nix"] {
+        for path in [
+            "/",
+            "/boot",
+            "/boot/efi",
+            "/home",
+            "/usr",
+            "/var",
+            "/root",
+            "/etc",
+            "/opt",
+            "/srv",
+            "/run",
+            "/tmp",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/snap",
+            "/nix",
+        ] {
             let mounts = vec![path.to_string()];
             assert!(system_mount_block(&mounts).is_some(), "should block {path}");
         }
+    }
+
+    #[test]
+    fn non_empty_text_handles_blanks() {
+        assert_eq!(non_empty_text(""), None);
+        assert_eq!(non_empty_text("   "), None);
+        assert_eq!(non_empty_text("value"), Some("value".to_string()));
+        assert_eq!(non_empty_text("  trim  "), Some("trim".to_string()));
     }
 }

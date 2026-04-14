@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Bootable
+GenericName=USB Image Writer
+Comment=Write bootable ISO and disk images to removable media
+Icon=io.bootable.app
+Exec=bootable
+Terminal=false
+Categories=System;Utility;
+Keywords=usb;iso;boot;image;flash;writer;
+StartupNotify=true

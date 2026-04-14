@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.bootable.app</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+
+  <name>Bootable</name>
+  <summary>Write bootable ISO and disk images to removable media</summary>
+
+  <description>
+    <p>
+      Bootable is a small GTK4 / libadwaita application for writing bootable
+      USB drives from ISO or raw disk image files. It supports Linux
+      isohybrid images (DD mode), Windows ISOs (UEFI and BIOS), optional
+      live-media persistence, checksum and signature verification, and a
+      dry-run mode.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Auto-detects isohybrid vs Windows images</li>
+      <li>GPT or MBR partitioning with UEFI, BIOS, or hybrid boot</li>
+      <li>FAT32 or NTFS target filesystems</li>
+      <li>Optional SHA-256 checksum and GPG signature verification</li>
+      <li>Optional ext4 persistence partition for live media</li>
+      <li>Refuses to overwrite anything mounted on a system path</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.bootable.app.desktop</launchable>
+
+  <url type="homepage">https://github.com/Pingasmaster/bootable</url>
+  <url type="bugtracker">https://github.com/Pingasmaster/bootable/issues</url>
+  <url type="vcs-browser">https://github.com/Pingasmaster/bootable</url>
+
+  <developer id="io.bootable">
+    <name>Bootable contributors</name>
+  </developer>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2026-04-14">
+      <description>
+        <p>Initial packaging with desktop integration.</p>
+      </description>
+    </release>
+  </releases>
+</component>

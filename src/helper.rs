@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gtk::glib;
 use std::env;
 use std::fs;
@@ -50,7 +50,8 @@ pub fn run_helper(plan_path: &Path) -> glib::ExitCode {
                         }
                         Err(err) => {
                             ok = false;
-                            let _ = writeln!(stdout, "DONE\tERR\t{}", sanitize_line(&err));
+                            let _ =
+                                writeln!(stdout, "DONE\tERR\t{}", sanitize_line(&err.to_string()));
                         }
                     },
                 }
@@ -151,7 +152,7 @@ where
         if status.success() {
             emit(UiEvent::Done(Ok(())));
         } else {
-            emit(UiEvent::Done(Err(format!(
+            emit(UiEvent::Done(Err(anyhow!(
                 "Helper exited with status {status}"
             ))));
         }
@@ -161,8 +162,8 @@ where
 }
 
 fn read_plan(path: &Path) -> Result<WritePlan> {
-    let data = fs::read(path)
-        .with_context(|| format!("reading plan {path}", path = path.display()))?;
+    let data =
+        fs::read(path).with_context(|| format!("reading plan {path}", path = path.display()))?;
     serde_json::from_slice(&data).context("parsing plan JSON")
 }
 
@@ -184,7 +185,13 @@ fn write_plan(plan: &WritePlan) -> Result<PathBuf> {
 
 fn sanitize_line(s: &str) -> String {
     s.chars()
-        .map(|c| if c == '\r' || c == '\n' || c == '\t' { ' ' } else { c })
+        .map(|c| {
+            if c == '\r' || c == '\n' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -198,8 +205,12 @@ fn parse_helper_line(line: &str) -> Option<UiEvent> {
             if status == "OK" {
                 Some(UiEvent::Done(Ok(())))
             } else {
-                let msg = if err.is_empty() { "Helper failed".to_string() } else { err.to_string() };
-                Some(UiEvent::Done(Err(msg)))
+                let msg = if err.is_empty() {
+                    "Helper failed".to_string()
+                } else {
+                    err.to_string()
+                };
+                Some(UiEvent::Done(Err(anyhow::Error::msg(msg))))
             }
         }
         _ => None,
@@ -265,7 +276,7 @@ mod tests {
     fn parse_done_err() {
         let event = parse_helper_line("DONE\tERR\tSomething went wrong").unwrap();
         match event {
-            UiEvent::Done(Err(msg)) => assert_eq!(msg, "Something went wrong"),
+            UiEvent::Done(Err(err)) => assert_eq!(err.to_string(), "Something went wrong"),
             _ => panic!("expected Done(Err)"),
         }
     }
@@ -274,7 +285,7 @@ mod tests {
     fn parse_done_err_no_message() {
         let event = parse_helper_line("DONE\tERR").unwrap();
         match event {
-            UiEvent::Done(Err(msg)) => assert_eq!(msg, "Helper failed"),
+            UiEvent::Done(Err(err)) => assert_eq!(err.to_string(), "Helper failed"),
             _ => panic!("expected Done(Err)"),
         }
     }
@@ -302,7 +313,7 @@ mod tests {
     fn parse_done_err_with_tabs_in_message() {
         let event = parse_helper_line("DONE\tERR\tfirst\tpart").unwrap();
         match event {
-            UiEvent::Done(Err(msg)) => assert_eq!(msg, "first\tpart"),
+            UiEvent::Done(Err(err)) => assert_eq!(err.to_string(), "first\tpart"),
             _ => panic!("expected Done(Err)"),
         }
     }

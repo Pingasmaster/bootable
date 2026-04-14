@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/bootable/app">
+    <file alias="icons/scalable/apps/io.bootable.app.svg" compressed="true">icons/hicolor/scalable/apps/io.bootable.app.svg</file>
+  </gresource>
+</gresources>

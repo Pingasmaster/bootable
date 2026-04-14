@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::process::Command;
-
 #[allow(clippy::cast_precision_loss)]
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -19,22 +17,11 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 pub fn command_exists(cmd: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg("command -v -- \"$1\" >/dev/null 2>&1")
-        .arg("--")
-        .arg(cmd)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    which::which(cmd).is_ok()
 }
 
 pub fn is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|output| output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "0")
-        .unwrap_or(false)
+    nix::unistd::Uid::effective().is_root()
 }
 
 #[cfg(test)]
@@ -92,7 +79,7 @@ mod tests {
 
     #[test]
     fn command_exists_rejects_shell_metacharacters() {
-        // Should return false, not execute the injected command
+        // which treats metacharacters as part of the name; should return false.
         assert!(!command_exists("ls; echo pwned"));
         assert!(!command_exists("$(echo ls)"));
     }

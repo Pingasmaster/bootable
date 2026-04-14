@@ -2,6 +2,7 @@
 name = "bootable"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
 description = "Graphical USB image writer for bootable media"
 license = "GPL-3.0-only"
 repository = "https://github.com/Pingasmaster/bootable"
@@ -10,10 +11,16 @@ keywords = ["usb", "boot", "image", "iso", "gui"]
 categories = ["filesystem", "gui"]
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.11.1", features = ["v4_20"] }
+gtk = { package = "gtk4", version = "0.11.2", features = ["v4_20"] }
 adw = { package = "libadwaita", version = "0.9.1", features = ["v1_8", "gtk_v4_20"] }
+async-channel = "2.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 anyhow = "1.0.102"
 tempfile = "3.27.0"
 sha2 = "0.10.9"
+nix = { version = "0.31", features = ["user"] }
+which = "8.0"
+
+[build-dependencies]
+glib-build-tools = "0.22"
