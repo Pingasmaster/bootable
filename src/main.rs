@@ -621,20 +621,33 @@ fn build_ui(app: &adw::Application) {
                 *flashing.borrow_mut() = true;
 
                 let sender = sender.clone();
+                let sender_panic = sender.clone();
                 std::thread::spawn(move || {
-                    if util::is_root() || dry_run {
-                        let sender = sender.clone();
-                        writer::run(&plan, move |event| {
-                            let _ = sender.send(event);
-                        });
-                    } else {
-                        let sender_events = sender.clone();
-                        let result = helper::run_helper_with_pkexec(&plan, move |event| {
-                            let _ = sender_events.send(event);
-                        });
-                        if let Err(err) = result {
-                            let _ = sender.send(UiEvent::Done(Err(err.to_string())));
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if util::is_root() || dry_run {
+                            let sender = sender.clone();
+                            writer::run(&plan, move |event| {
+                                let _ = sender.send(event);
+                            });
+                        } else {
+                            let sender_events = sender.clone();
+                            let result = helper::run_helper_with_pkexec(&plan, move |event| {
+                                let _ = sender_events.send(event);
+                            });
+                            if let Err(err) = result {
+                                let _ = sender.send(UiEvent::Done(Err(err.to_string())));
+                            }
                         }
+                    }));
+                    if let Err(payload) = outcome {
+                        let msg = payload
+                            .downcast_ref::<&'static str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        let _ = sender_panic.send(UiEvent::Done(Err(format!(
+                            "Write worker panicked: {msg}"
+                        ))));
                     }
                 });
             },
