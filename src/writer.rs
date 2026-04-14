@@ -177,6 +177,7 @@ where
         if !plan.iso_path.exists() {
             bail!("Image path does not exist");
         }
+        ensure_iso_is_not_device(&plan.iso_path, &plan.device_path)?;
         verify_iso(plan, &mut emit)?;
 
         if plan.dry_run {
@@ -221,6 +222,7 @@ fn iso_listing(path: &Path) -> Option<String> {
             .arg("l")
             .arg("-ba")
             .arg(path)
+            .stdin(Stdio::null())
             .output()
             .ok()?;
         if output.status.success() {
@@ -232,6 +234,7 @@ fn iso_listing(path: &Path) -> Option<String> {
         let output = Command::new("bsdtar")
             .arg("-tf")
             .arg(path)
+            .stdin(Stdio::null())
             .output()
             .ok()?;
         if output.status.success() {
@@ -315,6 +318,7 @@ fn verify_signature(
         .arg("--verify")
         .arg(signature_path)
         .arg(iso_path)
+        .stdin(Stdio::null())
         .output()
         .with_context(|| format!("running gpg on {sig}", sig = signature_path.display()))?;
     if output.status.success() {
@@ -1280,6 +1284,7 @@ fn find_partition_for_range(device: &str, start_mib: f64, end_mib: f64) -> Resul
 fn partitions_from_parted(device: &str) -> Result<Vec<(u32, f64, f64)>> {
     let output = Command::new("parted")
         .args(["-ms", device, "unit", "MiB", "print"])
+        .stdin(Stdio::null())
         .output()
         .with_context(|| format!("running parted on {device}"))?;
     if !output.status.success() {
@@ -1313,6 +1318,7 @@ fn parted_info(
 ) -> Result<PartedInfo> {
     let output = Command::new("parted")
         .args(["-ms", device, "unit", "MiB", "print"])
+        .stdin(Stdio::null())
         .output()
         .with_context(|| format!("running parted on {device}"))?;
     if !output.status.success() {
@@ -1532,6 +1538,7 @@ fn run_cmd(
     log(emit, format!("Running: {context}"));
     let output = Command::new(program)
         .args(args)
+        .stdin(Stdio::null())
         .output()
         .with_context(|| format!("running {program}"))?;
     if output.status.success() {
@@ -1553,7 +1560,9 @@ where
 {
     let mut cmd = Command::new(program);
     cmd.args(args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().with_context(|| format!("spawning {program}"))?;
     let stdout = child.stdout.take().context("capturing command stdout")?;
@@ -1659,7 +1668,9 @@ fn run_rsync_with_progress(
 
     let mut cmd = Command::new("rsync");
     cmd.args(&args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     log(emit, "Running: rsync (progress)".to_string());
 
@@ -1713,6 +1724,7 @@ fn verify_tree_with_rsync(
 
     let output = Command::new("rsync")
         .args(&args)
+        .stdin(Stdio::null())
         .output()
         .context("running rsync verification")?;
     if !output.status.success() {
@@ -1964,6 +1976,19 @@ fn ensure_block_device(path: &str) -> Result<()> {
     let file_type = metadata.file_type();
     if !file_type.is_block_device() {
         bail!("{path} is not a block device");
+    }
+    Ok(())
+}
+
+fn ensure_iso_is_not_device(iso_path: &Path, device_path: &str) -> Result<()> {
+    let canonical_iso = iso_path
+        .canonicalize()
+        .with_context(|| format!("resolving ISO path {iso}", iso = iso_path.display()))?;
+    let canonical_device = Path::new(device_path)
+        .canonicalize()
+        .with_context(|| format!("resolving device path {device_path}"))?;
+    if canonical_iso == canonical_device {
+        bail!("ISO path and target device resolve to the same location");
     }
     Ok(())
 }
