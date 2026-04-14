@@ -114,8 +114,6 @@ PreferencesPage
 ### Secondary benefits unlocked
 
 - The `add_row()` helper can be deleted.
-- Label ↔ widget accessibility association is handled by the rows themselves
-  (see §7) — no manual `set_mnemonic_widget` wiring needed.
 - Consistent HIG-compliant spacing, destructive/suggested styling, dark/light
   mode, RTL layout all come for free.
 - The form becomes responsive inside `adw::PreferencesPage` without adding any
@@ -312,35 +310,7 @@ The app has none of these. Every handler is a direct
 
 ---
 
-## 7. UI — accessibility
-
-Mostly absent today. Two categories of fix:
-
-**Subsumed by §2 (rows):** adopting `adw::EntryRow`, `SwitchRow`, `ComboRow`,
-`SpinRow`, `ActionRow` auto-associates the row title with the inner control
-for screen readers, which eliminates the need for manual
-`set_mnemonic_widget` wiring on ~13 form rows. This is the pragmatic path.
-
-**Still worth doing even without §2:**
-
-- `main.rs:646` `add_row()` should call
-  `lbl.set_mnemonic_widget(Some(widget))` — one line, links all 13 form
-  labels.
-- Button construction: `Button::with_label("Refresh")` →
-  `Button::with_mnemonic("_Refresh")` and similarly for Select, Start, Cancel,
-  Erase. Alt-key navigation works immediately.
-- Progress bar (`main.rs:176`) needs
-  `progress.update_property(&[Property::ValueMin(0.0), Property::ValueMax(1.0), Property::ValueNow(frac)])`
-  on every progress update (main.rs:468) so screen readers announce percentage.
-- Confirmation dialog (`main.rs:760` warning label) should set
-  `AccessibleRole::Alert` so screen readers announce the warning immediately
-  when the dialog opens.
-- `prompt.set_mnemonic_widget(Some(&confirm_entry))` links the "Type X to
-  confirm" label to its entry (main.rs:778 → 785).
-
----
-
-## 8. `writer.rs` — cleanup notes
+## 7. `writer.rs` — cleanup notes
 
 `writer.rs` is 3168 lines. Most of it is correctly shelling out to system
 tools; the concerns are narrow.
@@ -359,11 +329,11 @@ tools; the concerns are narrow.
   `mkfs.vfat`/`mkfs.ntfs`/`mkfs.ntfs3`/`mkfs.ext4`, `7z`/`bsdtar`, `rsync`,
   `gpg`, `parted`, `partprobe`/`blockdev`, `udevadm settle`, `sync`. **None
   have viable pure-Rust replacements** — don't waste time trying. The only
-  shell-out this document recommends replacing lives in `util.rs` (see §9).
+  shell-out this document recommends replacing lives in `util.rs` (see §8).
 
 ---
 
-## 9. `util.rs` — low-hanging fruit
+## 8. `util.rs` — low-hanging fruit
 
 Both public functions shell out unnecessarily:
 
@@ -385,7 +355,7 @@ shell-based code is correct. Treat as a separate later project.
 
 ---
 
-## 10. Dependencies and toolchain hygiene
+## 9. Dependencies and toolchain hygiene
 
 - **`gtk4 = "0.11.2"`** — patch bump from 0.11.1. Trivial.
 - **Feature flags**: stay on `v4_20` / `v1_8` for now. Only bump to `v4_22`
@@ -406,7 +376,7 @@ shell-based code is correct. Treat as a separate later project.
 
 ---
 
-## 11. Desktop integration (tracked for later)
+## 10. Desktop integration (tracked for later)
 
 Missing, all optional, all unlock store discoverability:
 
@@ -421,7 +391,7 @@ Low priority, but mentioned so it isn't rediscovered.
 
 ---
 
-## 12. Explicitly *not* recommended
+## 11. Explicitly *not* recommended
 
 Research-validated dead ends; recording them here stops them being
 re-proposed in future sessions.
@@ -453,10 +423,10 @@ re-proposed in future sessions.
 
 1. **Fix strict clippy (§1)** — unblocks the repo's own documented lint
    policy. ~30 minutes.
-2. **`util.rs` nix + which (§9)** — two tiny, zero-risk changes that remove
+2. **`util.rs` nix + which (§8)** — two tiny, zero-risk changes that remove
    per-call subprocess overhead. ~15 minutes.
 3. **Migrate form to `PreferencesGroup` + rows (§2)** — biggest UX win,
-   unlocks accessibility §7, responsive layout §5. Estimated half a day.
+   unlocks responsive layout §5. Estimated half a day.
 4. **Custom confirmation dialog → `adw::AlertDialog` (§3)** — smaller and
    well-scoped; drop `dialog_open` bookkeeping while there. ~1–2 hours.
 5. **`mpsc` + `idle_add_local` → `async-channel` + `spawn_future_local`
@@ -466,11 +436,11 @@ re-proposed in future sessions.
    settles. Half a day.
 7. **Actions + shortcuts + hamburger menu + `adw::AboutDialog` (§6)** —
    requires deciding on a menu structure. ~half a day.
-8. **Split the three `too_many_lines` functions in writer.rs (§8)** — not
+8. **Split the three `too_many_lines` functions in writer.rs (§7)** — not
    urgent, but cleans up the `#[allow]` annotations.
-9. **CI workflow (§10)** — only valuable *after* §1 so the pipeline doesn't
+9. **CI workflow (§9)** — only valuable *after* §1 so the pipeline doesn't
    immediately go red. ~1 hour.
-10. **Desktop integration (§11)** — whenever packaging for Flathub becomes a
+10. **Desktop integration (§10)** — whenever packaging for Flathub becomes a
     goal.
 
 ## Files referenced
