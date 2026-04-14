@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use gtk::glib;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -25,6 +25,10 @@ pub fn helper_plan_path() -> Option<PathBuf> {
     None
 }
 
+#[allow(
+    clippy::print_stderr,
+    reason = "helper role is a subprocess; stderr is the protocol for surfacing startup errors to the parent pkexec invocation"
+)]
 pub fn run_helper(plan_path: &Path) -> glib::ExitCode {
     if !is_root() {
         eprintln!("Helper must run as root");
@@ -33,29 +37,28 @@ pub fn run_helper(plan_path: &Path) -> glib::ExitCode {
 
     match read_plan(plan_path) {
         Ok(plan) => {
-            let _ = fs::remove_file(plan_path);
+            _ = fs::remove_file(plan_path);
             let mut stdout = std::io::stdout();
             let mut ok = true;
             let mut emit = |event: UiEvent| {
                 match event {
                     UiEvent::Log(msg) => {
-                        let _ = writeln!(stdout, "LOG\t{}", sanitize_line(&msg));
+                        _ = writeln!(stdout, "LOG\t{}", sanitize_line(&msg));
                     }
                     UiEvent::Progress(frac) => {
-                        let _ = writeln!(stdout, "PROGRESS\t{frac:.6}");
+                        _ = writeln!(stdout, "PROGRESS\t{frac:.6}");
                     }
                     UiEvent::Done(result) => match result {
                         Ok(()) => {
-                            let _ = writeln!(stdout, "DONE\tOK");
+                            _ = writeln!(stdout, "DONE\tOK");
                         }
                         Err(err) => {
                             ok = false;
-                            let _ =
-                                writeln!(stdout, "DONE\tERR\t{}", sanitize_line(&err.to_string()));
+                            _ = writeln!(stdout, "DONE\tERR\t{}", sanitize_line(&err.to_string()));
                         }
                     },
                 }
-                let _ = stdout.flush();
+                _ = stdout.flush();
             };
 
             crate::writer::run(&plan, &mut emit);
@@ -66,7 +69,7 @@ pub fn run_helper(plan_path: &Path) -> glib::ExitCode {
             }
         }
         Err(err) => {
-            let _ = fs::remove_file(plan_path);
+            _ = fs::remove_file(plan_path);
             eprintln!("Failed to read plan: {err}");
             glib::ExitCode::FAILURE
         }
@@ -108,7 +111,7 @@ where
     let mut child = cmd
         .spawn()
         .inspect_err(|_| {
-            let _ = fs::remove_file(&plan_path);
+            _ = fs::remove_file(&plan_path);
         })
         .context("spawning pkexec helper")?;
     let stdout = child.stdout.take().context("capturing helper stdout")?;
@@ -120,7 +123,7 @@ where
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
             if let Some(event) = parse_helper_line(&line) {
-                let _ = tx_out.send(event);
+                _ = tx_out.send(event);
             }
         }
     });
@@ -129,7 +132,7 @@ where
     let err_thread = thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
-            let _ = tx_err.send(UiEvent::Log(format!("helper: {line}")));
+            _ = tx_err.send(UiEvent::Log(format!("helper: {line}")));
         }
     });
 
@@ -143,11 +146,11 @@ where
         emit(event);
     }
 
-    let _ = out_thread.join();
-    let _ = err_thread.join();
+    _ = out_thread.join();
+    _ = err_thread.join();
 
     let status = child.wait().context("waiting for helper")?;
-    let _ = fs::remove_file(&plan_path);
+    _ = fs::remove_file(&plan_path);
     if !saw_done {
         if status.success() {
             emit(UiEvent::Done(Ok(())));
@@ -198,7 +201,7 @@ fn sanitize_line(s: &str) -> String {
 fn parse_helper_line(line: &str) -> Option<UiEvent> {
     let (tag, rest) = line.split_once('\t').map_or((line, ""), |(t, r)| (t, r));
     match tag {
-        "LOG" => Some(UiEvent::Log(rest.to_string())),
+        "LOG" => Some(UiEvent::Log(rest.to_owned())),
         "PROGRESS" => rest.parse::<f64>().ok().map(UiEvent::Progress),
         "DONE" => {
             let (status, err) = rest.split_once('\t').map_or((rest, ""), |(s, e)| (s, e));
@@ -206,9 +209,9 @@ fn parse_helper_line(line: &str) -> Option<UiEvent> {
                 Some(UiEvent::Done(Ok(())))
             } else {
                 let msg = if err.is_empty() {
-                    "Helper failed".to_string()
+                    "Helper failed".to_owned()
                 } else {
-                    err.to_string()
+                    err.to_owned()
                 };
                 Some(UiEvent::Done(Err(anyhow::Error::msg(msg))))
             }

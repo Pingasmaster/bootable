@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "writer.rs guards every index/slice with an explicit length or find-result check above the access site; converting them to .get() would add boilerplate without runtime benefit"
+)]
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
-use std::os::unix::fs::FileTypeExt;
+use std::io::{BufReader, Read, Write as _};
+use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -88,7 +93,10 @@ impl ProgressState {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "progress/size math: f64 precision is adequate for display-range byte counts"
+    )]
     fn update(&mut self, emit: &mut dyn FnMut(UiEvent), completed: u64, force: bool) {
         self.completed = completed.min(self.total);
         if force || self.last_emit.elapsed() >= Duration::from_millis(200) {
@@ -98,7 +106,10 @@ impl ProgressState {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "progress/size math: f64 precision is adequate for display-range byte counts"
+    )]
     fn update_stage(
         &mut self,
         emit: &mut dyn FnMut(UiEvent),
@@ -111,7 +122,11 @@ impl ProgressState {
             self.update(emit, base, force);
             return;
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped integer conversion for progress tracking"
+        )]
         let stage_done = ((stage_size as f64) * frac).round() as u64;
         self.update(emit, base.saturating_add(stage_done), force);
     }
@@ -147,12 +162,19 @@ impl<'a> ProgressStage<'a> {
             .update(emit, self.base.saturating_add(self.done), false);
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "progress/size math: f64 precision is adequate for display-range byte counts"
+    )]
     fn set_fraction(&mut self, emit: &mut dyn FnMut(UiEvent), frac: f64) {
         if self.size == 0 {
             return;
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped integer conversion for progress tracking"
+        )]
         {
             self.done = ((self.size as f64) * frac).round() as u64;
         }
@@ -175,7 +197,7 @@ where
     F: FnMut(UiEvent),
 {
     let result = (|| -> Result<()> {
-        log(&mut emit, "Starting write process".to_string());
+        log(&mut emit, "Starting write process".to_owned());
         if !plan.iso_path.exists() {
             bail!("Image path does not exist");
         }
@@ -185,7 +207,7 @@ where
         if plan.dry_run {
             log(
                 &mut emit,
-                "Dry run enabled (no writes will be performed)".to_string(),
+                "Dry run enabled (no writes will be performed)".to_owned(),
             );
         }
 
@@ -197,6 +219,10 @@ where
         match mode {
             ImageMode::IsoHybridDd => write_dd(plan, &mut emit),
             ImageMode::WindowsUefi => write_windows(plan, &mut emit),
+            #[allow(
+                clippy::unreachable,
+                reason = "detect_image_mode above resolves Auto to IsoHybridDd or WindowsUefi; any future variant must do the same"
+            )]
             ImageMode::Auto => unreachable!(),
         }
     })();
@@ -209,14 +235,13 @@ fn detect_image_mode(path: &Path, emit: &mut dyn FnMut(UiEvent)) -> ImageMode {
         let listing_lc = listing.to_lowercase();
         if listing_lc.contains("sources/install.wim") || listing_lc.contains("sources/install.esd")
         {
-            log(emit, "Detected Windows ISO".to_string());
+            log(emit, "Detected Windows ISO".to_owned());
             return ImageMode::WindowsUefi;
         }
     } else {
         log(
             emit,
-            "Auto-detect unavailable (install 7z or bsdtar); defaulting to ISOHybrid/DD"
-                .to_string(),
+            "Auto-detect unavailable (install 7z or bsdtar); defaulting to ISOHybrid/DD".to_owned(),
         );
     }
 
@@ -233,7 +258,7 @@ fn iso_listing(path: &Path) -> Option<String> {
             .output()
             .ok()?;
         if output.status.success() {
-            return Some(String::from_utf8_lossy(&output.stdout).to_string());
+            return Some(String::from_utf8_lossy(&output.stdout).into_owned());
         }
     }
 
@@ -245,7 +270,7 @@ fn iso_listing(path: &Path) -> Option<String> {
             .output()
             .ok()?;
         if output.status.success() {
-            return Some(String::from_utf8_lossy(&output.stdout).to_string());
+            return Some(String::from_utf8_lossy(&output.stdout).into_owned());
         }
     }
 
@@ -255,12 +280,12 @@ fn iso_listing(path: &Path) -> Option<String> {
 fn verify_iso(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     if let Some(checksum) = plan.checksum_sha256.as_deref() {
         let expected = resolve_checksum(checksum)?;
-        log(emit, "Verifying SHA256 checksum".to_string());
+        log(emit, "Verifying SHA256 checksum".to_owned());
         let actual = sha256_file(&plan.iso_path)?;
         if !actual.eq_ignore_ascii_case(&expected) {
             bail!("Checksum mismatch (expected {expected}, got {actual})");
         }
-        log(emit, "Checksum verified".to_string());
+        log(emit, "Checksum verified".to_owned());
     }
 
     if let Some(signature) = plan.signature_path.as_ref() {
@@ -301,7 +326,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     let mut file =
         File::open(path).with_context(|| format!("opening {path}", path = path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer).context("reading file")?;
         if read == 0 {
@@ -321,7 +346,7 @@ fn verify_signature(
     if !command_exists("gpg") {
         bail!("gpg not found; cannot verify signature");
     }
-    log(emit, "Verifying signature".to_string());
+    log(emit, "Verifying signature".to_owned());
     let output = Command::new("gpg")
         .arg("--verify")
         .arg(signature_path)
@@ -330,7 +355,7 @@ fn verify_signature(
         .output()
         .with_context(|| format!("running gpg on {sig}", sig = signature_path.display()))?;
     if output.status.success() {
-        log(emit, "Signature verified".to_string());
+        log(emit, "Signature verified".to_owned());
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -347,17 +372,17 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     }
 
     if plan.dry_run {
-        log(emit, "Dry run: would write ISO in DD mode".to_string());
+        log(emit, "Dry run: would write ISO in DD mode".to_owned());
         if plan.persistence_size_mib > 0 {
             validate_persistence(plan, emit)?;
         }
         return Ok(());
     }
 
-    log(emit, "Preparing device (unmounting)".to_string());
+    log(emit, "Preparing device (unmounting)".to_owned());
     unmount_device(&plan.device_path, emit)?;
 
-    log(emit, "Writing ISO (DD mode)".to_string());
+    log(emit, "Writing ISO (DD mode)".to_owned());
 
     let mut src = File::open(&plan.iso_path).context("opening ISO")?;
     ensure_block_device(&plan.device_path)?;
@@ -374,7 +399,7 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     let verify_bytes = if plan.verify_after { iso_size } else { 0 };
     let total = iso_size.saturating_add(verify_bytes).max(1);
     let mut written: u64 = 0;
-    let mut buffer = vec![0u8; 4 * 1024 * 1024];
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
     let mut progress = ProgressState::new(total);
 
     loop {
@@ -389,7 +414,7 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     }
 
     dst.sync_all().context("syncing device")?;
-    log(emit, "Syncing buffers".to_string());
+    log(emit, "Syncing buffers".to_owned());
     let status = Command::new("sync").status().context("running sync")?;
     if !status.success() {
         bail!("sync failed: {status}");
@@ -397,19 +422,19 @@ fn write_dd(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     progress.update(emit, written, true);
 
     if plan.verify_after {
-        log(emit, "Verifying written data".to_string());
+        log(emit, "Verifying written data".to_owned());
         let mut verify_stage = progress.stage(written, iso_size);
         verify_dd_write(plan, emit, Some(&mut verify_stage))?;
         verify_stage.finish(emit);
     }
 
     if plan.persistence_size_mib > 0 {
-        log(emit, "Creating persistence partition".to_string());
+        log(emit, "Creating persistence partition".to_owned());
         apply_persistence(plan, emit)?;
     }
 
     progress.update(emit, total, true);
-    log(emit, "DD write completed".to_string());
+    log(emit, "DD write completed".to_owned());
     Ok(())
 }
 
@@ -442,7 +467,10 @@ fn write_windows_uefi_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "long linear pipeline — see MODERNIZATION follow-up"
+)]
 fn write_windows_fat32(
     plan: &WritePlan,
     emit: &mut dyn FnMut(UiEvent),
@@ -459,7 +487,7 @@ fn write_windows_fat32(
     }
 
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
-    let fs_overhead = 10 * 1024 * 1024u64; // 10 MiB for partition alignment + FAT32 metadata
+    let fs_overhead = 10 * 1024 * 1024_u64; // 10 MiB for partition alignment + FAT32 metadata
     if let Some(device_size) = plan.device_size_bytes
         && iso_size.saturating_add(fs_overhead) > device_size
     {
@@ -469,20 +497,20 @@ fn write_windows_fat32(
     if plan.dry_run {
         log(
             emit,
-            "Dry run: would format and copy Windows files (FAT32)".to_string(),
+            "Dry run: would format and copy Windows files (FAT32)".to_owned(),
         );
         return Ok(());
     }
 
-    log(emit, "Preparing device (unmounting)".to_string());
+    log(emit, "Preparing device (unmounting)".to_owned());
     unmount_device(&plan.device_path, emit)?;
 
-    log(emit, "Partitioning device".to_string());
+    log(emit, "Partitioning device".to_owned());
     let scheme = if install_bios {
         if plan.partition_scheme != PartitionScheme::Mbr {
             log(
                 emit,
-                "BIOS support requires MBR; switching partition scheme to MBR".to_string(),
+                "BIOS support requires MBR; switching partition scheme to MBR".to_owned(),
             );
         }
         PartitionScheme::Mbr
@@ -502,14 +530,14 @@ fn write_windows_fat32(
             ),
         );
     }
-    log(emit, "Waiting for partition device".to_string());
+    log(emit, "Waiting for partition device".to_owned());
     wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
 
-    log(emit, "Formatting FAT32".to_string());
+    log(emit, "Formatting FAT32".to_owned());
     let mkfs_args = vec![
-        "-F".to_string(),
-        "32".to_string(),
-        "-n".to_string(),
+        "-F".to_owned(),
+        "32".to_owned(),
+        "-n".to_owned(),
         label,
         partition.clone(),
     ];
@@ -518,27 +546,27 @@ fn write_windows_fat32(
     let iso_dir = tempfile::tempdir().context("creating temp dir for ISO")?;
     let usb_dir = tempfile::tempdir().context("creating temp dir for USB")?;
 
-    log(emit, "Mounting ISO".to_string());
+    log(emit, "Mounting ISO".to_owned());
     let mount_iso_args = vec![
-        "-o".to_string(),
-        "loop,ro".to_string(),
-        plan.iso_path.to_string_lossy().to_string(),
-        iso_dir.path().to_string_lossy().to_string(),
+        "-o".to_owned(),
+        "loop,ro".to_owned(),
+        plan.iso_path.to_string_lossy().into_owned(),
+        iso_dir.path().to_string_lossy().into_owned(),
     ];
     run_cmd(emit, "mount", &mount_iso_args, "mount ISO")?;
 
-    log(emit, "Mounting USB".to_string());
-    let mount_usb_args = vec![partition, usb_dir.path().to_string_lossy().to_string()];
+    log(emit, "Mounting USB".to_owned());
+    let mount_usb_args = vec![partition, usb_dir.path().to_string_lossy().into_owned()];
     if let Err(err) = run_cmd(emit, "mount", &mount_usb_args, "mount USB") {
-        let _ = Command::new("umount").arg(iso_dir.path()).status();
+        _ = Command::new("umount").arg(iso_dir.path()).status();
         return Err(err);
     }
 
     let copy_result = (|| -> Result<()> {
-        log(emit, "Copying files".to_string());
+        log(emit, "Copying files".to_owned());
         let rsync_args = vec![
-            "--exclude=/sources/install.wim".to_string(),
-            "--exclude=/sources/install.esd".to_string(),
+            "--exclude=/sources/install.wim".to_owned(),
+            "--exclude=/sources/install.esd".to_owned(),
         ];
         let wim_path = iso_dir.path().join("sources/install.wim");
         let esd_path = iso_dir.path().join("sources/install.esd");
@@ -590,7 +618,7 @@ fn write_windows_fat32(
         } else {
             log(
                 emit,
-                "No install.wim/esd found; ISO may be non-Windows".to_string(),
+                "No install.wim/esd found; ISO may be non-Windows".to_owned(),
             );
         }
 
@@ -600,8 +628,8 @@ fn write_windows_fat32(
 
         if plan.verify_after {
             let verify_args = vec![
-                "--exclude=/sources/install.wim".to_string(),
-                "--exclude=/sources/install.esd".to_string(),
+                "--exclude=/sources/install.wim".to_owned(),
+                "--exclude=/sources/install.esd".to_owned(),
             ];
             verify_tree_with_rsync(emit, iso_dir.path(), usb_dir.path(), &verify_args)?;
             verify_windows_install_media(iso_dir.path(), usb_dir.path(), emit)?;
@@ -610,21 +638,21 @@ fn write_windows_fat32(
         Ok(())
     })();
 
-    log(emit, "Unmounting USB".to_string());
-    let _ = Command::new("umount").arg(usb_dir.path()).status();
+    log(emit, "Unmounting USB".to_owned());
+    _ = Command::new("umount").arg(usb_dir.path()).status();
 
-    log(emit, "Unmounting ISO".to_string());
-    let _ = Command::new("umount").arg(iso_dir.path()).status();
+    log(emit, "Unmounting ISO".to_owned());
+    _ = Command::new("umount").arg(iso_dir.path()).status();
 
     copy_result?;
 
-    log(emit, "Syncing buffers".to_string());
+    log(emit, "Syncing buffers".to_owned());
     let status = Command::new("sync").status().context("running sync")?;
     if !status.success() {
         bail!("sync failed: {status}");
     }
     emit(UiEvent::Progress(1.0));
-    log(emit, "Windows FAT32 write completed".to_string());
+    log(emit, "Windows FAT32 write completed".to_owned());
     Ok(())
 }
 
@@ -633,7 +661,7 @@ fn write_windows_ntfs_uefi(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     if scheme == PartitionScheme::Mbr {
         log(
             emit,
-            "UEFI:NTFS on MBR is enabled (some firmware may prefer GPT)".to_string(),
+            "UEFI:NTFS on MBR is enabled (some firmware may prefer GPT)".to_owned(),
         );
     }
     write_windows_ntfs_with_esp(plan, emit, scheme, false)
@@ -655,7 +683,7 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     };
 
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
-    let fs_overhead = 10 * 1024 * 1024u64; // 10 MiB for partition alignment + NTFS metadata
+    let fs_overhead = 10 * 1024 * 1024_u64; // 10 MiB for partition alignment + NTFS metadata
     if let Some(device_size) = plan.device_size_bytes
         && iso_size.saturating_add(fs_overhead) > device_size
     {
@@ -665,28 +693,28 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     if plan.dry_run {
         log(
             emit,
-            "Dry run: would format and copy Windows files (NTFS BIOS)".to_string(),
+            "Dry run: would format and copy Windows files (NTFS BIOS)".to_owned(),
         );
         return Ok(());
     }
 
-    log(emit, "Preparing device (unmounting)".to_string());
+    log(emit, "Preparing device (unmounting)".to_owned());
     unmount_device(&plan.device_path, emit)?;
 
-    log(emit, "Partitioning device (NTFS)".to_string());
+    log(emit, "Partitioning device (NTFS)".to_owned());
     let scheme = if plan.partition_scheme == PartitionScheme::Mbr {
         plan.partition_scheme
     } else {
         log(
             emit,
-            "BIOS support requires MBR; switching partition scheme to MBR".to_string(),
+            "BIOS support requires MBR; switching partition scheme to MBR".to_owned(),
         );
         PartitionScheme::Mbr
     };
     create_ntfs_partition(&plan.device_path, scheme, emit)?;
 
     let partition = partition_path(&plan.device_path);
-    log(emit, "Waiting for partition device".to_string());
+    log(emit, "Waiting for partition device".to_owned());
     wait_for_device_node(&partition).with_context(|| format!("waiting for {partition}"))?;
 
     let ntfs_label = sanitize_ntfs_label(&plan.volume_label);
@@ -699,10 +727,10 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
             ),
         );
     }
-    log(emit, "Formatting NTFS".to_string());
+    log(emit, "Formatting NTFS".to_owned());
     let mkfs_ntfs_args = vec![
-        "-F".to_string(),
-        "-L".to_string(),
+        "-F".to_owned(),
+        "-L".to_owned(),
         ntfs_label,
         partition.clone(),
     ];
@@ -711,24 +739,24 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
     let iso_dir = tempfile::tempdir().context("creating temp dir for ISO")?;
     let usb_dir = tempfile::tempdir().context("creating temp dir for NTFS")?;
 
-    log(emit, "Mounting ISO".to_string());
+    log(emit, "Mounting ISO".to_owned());
     let mount_iso_args = vec![
-        "-o".to_string(),
-        "loop,ro".to_string(),
-        plan.iso_path.to_string_lossy().to_string(),
-        iso_dir.path().to_string_lossy().to_string(),
+        "-o".to_owned(),
+        "loop,ro".to_owned(),
+        plan.iso_path.to_string_lossy().into_owned(),
+        iso_dir.path().to_string_lossy().into_owned(),
     ];
     run_cmd(emit, "mount", &mount_iso_args, "mount ISO")?;
 
-    log(emit, "Mounting NTFS".to_string());
-    let mount_usb_args = vec![partition, usb_dir.path().to_string_lossy().to_string()];
+    log(emit, "Mounting NTFS".to_owned());
+    let mount_usb_args = vec![partition, usb_dir.path().to_string_lossy().into_owned()];
     if let Err(err) = run_cmd(emit, "mount", &mount_usb_args, "mount NTFS") {
-        let _ = Command::new("umount").arg(iso_dir.path()).status();
+        _ = Command::new("umount").arg(iso_dir.path()).status();
         return Err(err);
     }
 
     let copy_result = (|| -> Result<()> {
-        log(emit, "Copying files to NTFS".to_string());
+        log(emit, "Copying files to NTFS".to_owned());
         let rsync_args = Vec::new();
         run_rsync_with_progress(emit, iso_dir.path(), usb_dir.path(), &rsync_args)?;
         install_bios_grub(&plan.device_path, usb_dir.path(), FileSystem::Ntfs, emit)?;
@@ -738,20 +766,20 @@ fn write_windows_ntfs_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> R
         Ok(())
     })();
 
-    log(emit, "Unmounting NTFS".to_string());
-    let _ = Command::new("umount").arg(usb_dir.path()).status();
-    log(emit, "Unmounting ISO".to_string());
-    let _ = Command::new("umount").arg(iso_dir.path()).status();
+    log(emit, "Unmounting NTFS".to_owned());
+    _ = Command::new("umount").arg(usb_dir.path()).status();
+    log(emit, "Unmounting ISO".to_owned());
+    _ = Command::new("umount").arg(iso_dir.path()).status();
 
     copy_result?;
 
-    log(emit, "Syncing buffers".to_string());
+    log(emit, "Syncing buffers".to_owned());
     let status = Command::new("sync").status().context("running sync")?;
     if !status.success() {
         bail!("sync failed: {status}");
     }
     emit(UiEvent::Progress(1.0));
-    log(emit, "Windows BIOS NTFS write completed".to_string());
+    log(emit, "Windows BIOS NTFS write completed".to_owned());
     Ok(())
 }
 
@@ -761,14 +789,17 @@ fn write_windows_ntfs_uefi_bios(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent))
     } else {
         log(
             emit,
-            "UEFI+BIOS with NTFS requires MBR; switching partition scheme to MBR".to_string(),
+            "UEFI+BIOS with NTFS requires MBR; switching partition scheme to MBR".to_owned(),
         );
         PartitionScheme::Mbr
     };
     write_windows_ntfs_with_esp(plan, emit, scheme, true)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "long linear pipeline — see MODERNIZATION follow-up"
+)]
 fn write_windows_ntfs_with_esp(
     plan: &WritePlan,
     emit: &mut dyn FnMut(UiEvent),
@@ -777,7 +808,7 @@ fn write_windows_ntfs_with_esp(
 ) -> Result<()> {
     let iso_size = plan.iso_path.metadata().context("reading ISO size")?.len();
     if let Some(device_size) = plan.device_size_bytes {
-        let overhead = 260 * 1024 * 1024u64;
+        let overhead = 260 * 1024 * 1024_u64;
         if iso_size.saturating_add(overhead) > device_size {
             bail!("ISO is too large for the selected device");
         }
@@ -812,25 +843,25 @@ fn write_windows_ntfs_with_esp(
     if plan.dry_run {
         log(
             emit,
-            "Dry run: would format ESP+NTFS and copy Windows files".to_string(),
+            "Dry run: would format ESP+NTFS and copy Windows files".to_owned(),
         );
         return Ok(());
     }
 
-    log(emit, "Preparing device (unmounting)".to_string());
+    log(emit, "Preparing device (unmounting)".to_owned());
     unmount_device(&plan.device_path, emit)?;
 
-    log(emit, "Partitioning device (ESP + NTFS)".to_string());
+    log(emit, "Partitioning device (ESP + NTFS)".to_owned());
     create_windows_partitions_ntfs(&plan.device_path, scheme, emit)?;
 
     let esp_partition = partition_path_for(&plan.device_path, 1);
     let data_partition = partition_path_for(&plan.device_path, 2);
-    log(emit, "Waiting for partition devices".to_string());
+    log(emit, "Waiting for partition devices".to_owned());
     wait_for_device_node(&esp_partition).with_context(|| format!("waiting for {esp_partition}"))?;
     wait_for_device_node(&data_partition)
         .with_context(|| format!("waiting for {data_partition}"))?;
 
-    let esp_label = "BOOT".to_string();
+    let esp_label = "BOOT".to_owned();
     let ntfs_label = sanitize_ntfs_label(&plan.volume_label);
     if ntfs_label != plan.volume_label {
         log(
@@ -842,20 +873,20 @@ fn write_windows_ntfs_with_esp(
         );
     }
 
-    log(emit, "Formatting ESP (FAT32)".to_string());
+    log(emit, "Formatting ESP (FAT32)".to_owned());
     let mkfs_args = vec![
-        "-F".to_string(),
-        "32".to_string(),
-        "-n".to_string(),
+        "-F".to_owned(),
+        "32".to_owned(),
+        "-n".to_owned(),
         esp_label,
         esp_partition.clone(),
     ];
     run_cmd(emit, "mkfs.vfat", &mkfs_args, "mkfs.vfat")?;
 
-    log(emit, "Formatting NTFS".to_string());
+    log(emit, "Formatting NTFS".to_owned());
     let mkfs_ntfs_args = vec![
-        "-F".to_string(),
-        "-L".to_string(),
+        "-F".to_owned(),
+        "-L".to_owned(),
         ntfs_label.clone(),
         data_partition.clone(),
     ];
@@ -865,48 +896,47 @@ fn write_windows_ntfs_with_esp(
     let esp_dir = tempfile::tempdir().context("creating temp dir for ESP")?;
     let data_dir = tempfile::tempdir().context("creating temp dir for NTFS")?;
 
-    log(emit, "Mounting ISO".to_string());
+    log(emit, "Mounting ISO".to_owned());
     let mount_iso_args = vec![
-        "-o".to_string(),
-        "loop,ro".to_string(),
-        plan.iso_path.to_string_lossy().to_string(),
-        iso_dir.path().to_string_lossy().to_string(),
+        "-o".to_owned(),
+        "loop,ro".to_owned(),
+        plan.iso_path.to_string_lossy().into_owned(),
+        iso_dir.path().to_string_lossy().into_owned(),
     ];
     run_cmd(emit, "mount", &mount_iso_args, "mount ISO")?;
 
-    log(emit, "Mounting ESP".to_string());
-    let mount_esp_args = vec![esp_partition, esp_dir.path().to_string_lossy().to_string()];
+    log(emit, "Mounting ESP".to_owned());
+    let mount_esp_args = vec![esp_partition, esp_dir.path().to_string_lossy().into_owned()];
     if let Err(err) = run_cmd(emit, "mount", &mount_esp_args, "mount ESP") {
-        let _ = Command::new("umount").arg(iso_dir.path()).status();
+        _ = Command::new("umount").arg(iso_dir.path()).status();
         return Err(err);
     }
 
-    log(emit, "Mounting NTFS".to_string());
+    log(emit, "Mounting NTFS".to_owned());
     let mount_data_args = vec![
         data_partition,
-        data_dir.path().to_string_lossy().to_string(),
+        data_dir.path().to_string_lossy().into_owned(),
     ];
     if let Err(err) = run_cmd(emit, "mount", &mount_data_args, "mount NTFS") {
-        let _ = Command::new("umount").arg(esp_dir.path()).status();
-        let _ = Command::new("umount").arg(iso_dir.path()).status();
+        _ = Command::new("umount").arg(esp_dir.path()).status();
+        _ = Command::new("umount").arg(iso_dir.path()).status();
         return Err(err);
     }
 
     let copy_result = (|| -> Result<()> {
-        log(emit, "Copying files to NTFS".to_string());
+        log(emit, "Copying files to NTFS".to_owned());
         let rsync_args = Vec::new();
         run_rsync_with_progress(emit, iso_dir.path(), data_dir.path(), &rsync_args)?;
 
-        log(emit, "Installing UEFI:NTFS bootloader".to_string());
+        log(emit, "Installing UEFI:NTFS bootloader".to_owned());
         let secure =
             install_uefi_ntfs_loaders(esp_dir.path(), &ntfs_label, plan.secure_boot_only, emit)?;
         if secure {
-            log(emit, "Secure Boot: signed shim/grub installed".to_string());
+            log(emit, "Secure Boot: signed shim/grub installed".to_owned());
         } else {
             log(
                 emit,
-                "Secure Boot: unsigned GRUB installed (may need to disable Secure Boot)"
-                    .to_string(),
+                "Secure Boot: unsigned GRUB installed (may need to disable Secure Boot)".to_owned(),
             );
         }
 
@@ -921,22 +951,22 @@ fn write_windows_ntfs_with_esp(
         Ok(())
     })();
 
-    log(emit, "Unmounting NTFS".to_string());
-    let _ = Command::new("umount").arg(data_dir.path()).status();
-    log(emit, "Unmounting ESP".to_string());
-    let _ = Command::new("umount").arg(esp_dir.path()).status();
-    log(emit, "Unmounting ISO".to_string());
-    let _ = Command::new("umount").arg(iso_dir.path()).status();
+    log(emit, "Unmounting NTFS".to_owned());
+    _ = Command::new("umount").arg(data_dir.path()).status();
+    log(emit, "Unmounting ESP".to_owned());
+    _ = Command::new("umount").arg(esp_dir.path()).status();
+    log(emit, "Unmounting ISO".to_owned());
+    _ = Command::new("umount").arg(iso_dir.path()).status();
 
     copy_result?;
 
-    log(emit, "Syncing buffers".to_string());
+    log(emit, "Syncing buffers".to_owned());
     let status = Command::new("sync").status().context("running sync")?;
     if !status.success() {
         bail!("sync failed: {status}");
     }
     emit(UiEvent::Progress(1.0));
-    log(emit, "Windows NTFS write completed".to_string());
+    log(emit, "Windows NTFS write completed".to_owned());
     Ok(())
 }
 
@@ -951,7 +981,7 @@ fn handle_wim(
     fs::create_dir_all(&dest_dir).context("creating sources directory")?;
 
     if size <= FAT32_LIMIT {
-        log(emit, "Copying install image".to_string());
+        log(emit, "Copying install image".to_owned());
         let dest_path = dest_dir.join(
             wim_path
                 .file_name()
@@ -964,18 +994,18 @@ fn handle_wim(
         return Ok(());
     }
 
-    log(emit, "Splitting install image (WIM/ESD > 4GiB)".to_string());
+    log(emit, "Splitting install image (WIM/ESD > 4GiB)".to_owned());
     let split_target = dest_dir.join("install.swm");
-    let split_target_str = split_target.to_string_lossy().to_string();
+    let split_target_str = split_target.to_string_lossy().into_owned();
 
     if command_exists("wimlib-imagex") {
         let args = vec![
-            "split".to_string(),
-            wim_path.to_string_lossy().to_string(),
+            "split".to_owned(),
+            wim_path.to_string_lossy().into_owned(),
             split_target_str,
-            "4000".to_string(),
+            "4000".to_owned(),
         ];
-        log(emit, "Running: wimlib-imagex split".to_string());
+        log(emit, "Running: wimlib-imagex split".to_owned());
         {
             let mut progress_cb = |event| match event {
                 CmdEvent::Progress(frac) => {
@@ -999,11 +1029,11 @@ fn handle_wim(
 
     if command_exists("wimsplit") {
         let args = vec![
-            wim_path.to_string_lossy().to_string(),
+            wim_path.to_string_lossy().into_owned(),
             split_target_str,
-            "4000".to_string(),
+            "4000".to_owned(),
         ];
-        log(emit, "Running: wimsplit".to_string());
+        log(emit, "Running: wimsplit".to_owned());
         {
             let mut progress_cb = |event| match event {
                 CmdEvent::Progress(frac) => {
@@ -1037,11 +1067,11 @@ fn copy_file_buffered(
     let mut input =
         File::open(src).with_context(|| format!("opening {path}", path = src.display()))?;
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).ok();
+        _ = fs::create_dir_all(parent);
     }
     let mut output =
         File::create(dst).with_context(|| format!("creating {path}", path = dst.display()))?;
-    let mut buffer = vec![0u8; 4 * 1024 * 1024];
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
     loop {
         let read = input.read(&mut buffer).context("reading input file")?;
         if read == 0 {
@@ -1063,31 +1093,31 @@ fn create_partition(
     scheme: PartitionScheme,
     emit: &mut dyn FnMut(UiEvent),
 ) -> Result<()> {
-    let mut args = vec!["-s".to_string(), device.to_string(), "mklabel".to_string()];
+    let mut args = vec!["-s".to_owned(), device.to_owned(), "mklabel".to_owned()];
     match scheme {
-        PartitionScheme::Gpt => args.push("gpt".to_string()),
-        PartitionScheme::Mbr => args.push("msdos".to_string()),
+        PartitionScheme::Gpt => args.push("gpt".to_owned()),
+        PartitionScheme::Mbr => args.push("msdos".to_owned()),
     }
     run_cmd(emit, "parted", &args, "parted mklabel")?;
 
     let mkpart_args = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "mkpart".to_string(),
-        "primary".to_string(),
-        "fat32".to_string(),
-        "1MiB".to_string(),
-        "100%".to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "mkpart".to_owned(),
+        "primary".to_owned(),
+        "fat32".to_owned(),
+        "1MiB".to_owned(),
+        "100%".to_owned(),
     ];
     run_cmd(emit, "parted", &mkpart_args, "parted mkpart")?;
 
-    let mut set_args = vec!["-s".to_string(), device.to_string(), "set".to_string()];
-    set_args.push("1".to_string());
+    let mut set_args = vec!["-s".to_owned(), device.to_owned(), "set".to_owned()];
+    set_args.push("1".to_owned());
     match scheme {
-        PartitionScheme::Gpt => set_args.push("esp".to_string()),
-        PartitionScheme::Mbr => set_args.push("boot".to_string()),
+        PartitionScheme::Gpt => set_args.push("esp".to_owned()),
+        PartitionScheme::Mbr => set_args.push("boot".to_owned()),
     }
-    set_args.push("on".to_string());
+    set_args.push("on".to_owned());
     run_cmd(emit, "parted", &set_args, "parted set")?;
 
     refresh_partition_table(device);
@@ -1105,31 +1135,31 @@ fn create_ntfs_partition(
     }
 
     let args = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "mklabel".to_string(),
-        "msdos".to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "mklabel".to_owned(),
+        "msdos".to_owned(),
     ];
     run_cmd(emit, "parted", &args, "parted mklabel")?;
 
     let mkpart_args = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "mkpart".to_string(),
-        "primary".to_string(),
-        "ntfs".to_string(),
-        "1MiB".to_string(),
-        "100%".to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "mkpart".to_owned(),
+        "primary".to_owned(),
+        "ntfs".to_owned(),
+        "1MiB".to_owned(),
+        "100%".to_owned(),
     ];
     run_cmd(emit, "parted", &mkpart_args, "parted mkpart")?;
 
     let set_args = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "set".to_string(),
-        "1".to_string(),
-        "boot".to_string(),
-        "on".to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "set".to_owned(),
+        "1".to_owned(),
+        "boot".to_owned(),
+        "on".to_owned(),
     ];
     run_cmd(emit, "parted", &set_args, "parted set boot")?;
 
@@ -1148,21 +1178,21 @@ fn create_windows_partitions_ntfs(
         PartitionScheme::Mbr => "msdos",
     };
     let args = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "mklabel".to_string(),
-        label.to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "mklabel".to_owned(),
+        label.to_owned(),
     ];
     run_cmd(emit, "parted", &args, "parted mklabel")?;
 
     let mkpart_esp = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "mkpart".to_string(),
-        "ESP".to_string(),
-        "fat32".to_string(),
-        "1MiB".to_string(),
-        "201MiB".to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "mkpart".to_owned(),
+        "ESP".to_owned(),
+        "fat32".to_owned(),
+        "1MiB".to_owned(),
+        "201MiB".to_owned(),
     ];
     run_cmd(emit, "parted", &mkpart_esp, "parted mkpart ESP")?;
 
@@ -1171,23 +1201,23 @@ fn create_windows_partitions_ntfs(
         PartitionScheme::Mbr => "boot",
     };
     let set_esp = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "set".to_string(),
-        "1".to_string(),
-        flag.to_string(),
-        "on".to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "set".to_owned(),
+        "1".to_owned(),
+        flag.to_owned(),
+        "on".to_owned(),
     ];
     run_cmd(emit, "parted", &set_esp, "parted set flag")?;
 
     let mkpart_ntfs = vec![
-        "-s".to_string(),
-        device.to_string(),
-        "mkpart".to_string(),
-        "primary".to_string(),
-        "ntfs".to_string(),
-        "201MiB".to_string(),
-        "100%".to_string(),
+        "-s".to_owned(),
+        device.to_owned(),
+        "mkpart".to_owned(),
+        "primary".to_owned(),
+        "ntfs".to_owned(),
+        "201MiB".to_owned(),
+        "100%".to_owned(),
     ];
     run_cmd(emit, "parted", &mkpart_ntfs, "parted mkpart ntfs")?;
 
@@ -1233,11 +1263,11 @@ fn apply_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<
     let start_arg = format!("{start}MiB");
     let end_arg = format!("{end}MiB");
     let mkpart_args = vec![
-        "-s".to_string(),
+        "-s".to_owned(),
         plan.device_path.clone(),
-        "mkpart".to_string(),
-        "primary".to_string(),
-        "ext4".to_string(),
+        "mkpart".to_owned(),
+        "primary".to_owned(),
+        "ext4".to_owned(),
         start_arg,
         end_arg,
     ];
@@ -1263,8 +1293,8 @@ fn apply_persistence(plan: &WritePlan, emit: &mut dyn FnMut(UiEvent)) -> Result<
         );
     }
     let mkfs_args = vec![
-        "-F".to_string(),
-        "-L".to_string(),
+        "-F".to_owned(),
+        "-L".to_owned(),
         label.clone(),
         partition.clone(),
     ];
@@ -1282,7 +1312,10 @@ fn persistence_bounds(info: &PartedInfo, size_mib: u64) -> Result<(f64, f64)> {
         bail!("Persistence size must be greater than 0");
     }
     let start = (info.last_end_mib + 1.0).ceil();
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "progress/size math: f64 precision is adequate for display-range byte counts"
+    )]
     let end = start + size_mib as f64;
     let max_end = info.device_size_mib - 4.0;
     if end > max_end {
@@ -1391,7 +1424,10 @@ fn parted_info(
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "progress/size math: f64 precision is adequate for display-range byte counts"
+    )]
     let fallback_size = device_size_bytes.map(|bytes| bytes as f64 / 1024.0 / 1024.0);
     let device_size_mib = device_size_mib
         .or(fallback_size)
@@ -1425,27 +1461,27 @@ fn sanitize_ext4_label(label: &str) -> String {
     }
     let trimmed = sanitized.trim();
     if trimmed.is_empty() {
-        "persistence".to_string()
+        "persistence".to_owned()
     } else {
-        trimmed.to_string()
+        trimmed.to_owned()
     }
 }
 
 fn create_persistence_conf(partition: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     if !command_exists("mount") || !command_exists("umount") {
         bail!(
-            "Persistence label is 'persistence' but mount/umount are missing — cannot write persistence.conf"
+            "Persistence label is 'persistence' but mount/umount are missing - cannot write persistence.conf"
         );
     }
     let mount_dir = tempfile::tempdir().context("creating persistence mount dir")?;
     let mount_args = vec![
-        partition.to_string(),
-        mount_dir.path().to_string_lossy().to_string(),
+        partition.to_owned(),
+        mount_dir.path().to_string_lossy().into_owned(),
     ];
     run_cmd(emit, "mount", &mount_args, "mount persistence")?;
     let conf_path = mount_dir.path().join("persistence.conf");
     fs::write(&conf_path, "/ union\n").context("writing persistence.conf")?;
-    let umount_args = vec![mount_dir.path().to_string_lossy().to_string()];
+    let umount_args = vec![mount_dir.path().to_string_lossy().into_owned()];
     run_cmd(emit, "umount", &umount_args, "umount persistence")?;
     Ok(())
 }
@@ -1459,8 +1495,8 @@ fn verify_dd_write(
     let mut src = File::open(&plan.iso_path).context("opening ISO for verify")?;
     let mut dst = File::open(&plan.device_path)
         .with_context(|| format!("opening device {device}", device = plan.device_path))?;
-    let mut buffer_src = vec![0u8; 4 * 1024 * 1024];
-    let mut buffer_dst = vec![0u8; 4 * 1024 * 1024];
+    let mut buffer_src = vec![0_u8; 4 * 1024 * 1024];
+    let mut buffer_dst = vec![0_u8; 4 * 1024 * 1024];
     let mut compared: u64 = 0;
     let mut last_update = Instant::now();
 
@@ -1484,7 +1520,10 @@ fn verify_dd_write(
                 format!(
                     "Verifying... {percent:.0}%",
                     percent = {
-                        #[allow(clippy::cast_precision_loss)]
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            reason = "progress/size math: f64 precision is adequate for display-range byte counts"
+                        )]
                         {
                             (compared as f64 / iso_size.max(1) as f64) * 100.0
                         }
@@ -1495,7 +1534,7 @@ fn verify_dd_write(
         }
     }
 
-    log(emit, "Verification completed".to_string());
+    log(emit, "Verification completed".to_owned());
     Ok(())
 }
 
@@ -1516,7 +1555,7 @@ fn unmount_device(device_path: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()
             ),
         );
         if command_exists("udisksctl") {
-            let args = vec!["unmount".to_string(), "-b".to_string(), mount.path];
+            let args = vec!["unmount".to_owned(), "-b".to_owned(), mount.path];
             if run_cmd(emit, "udisksctl", &args, "udisksctl unmount").is_ok() {
                 continue;
             }
@@ -1536,15 +1575,15 @@ fn unmount_device(device_path: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()
 
 fn refresh_partition_table(device: &str) {
     if command_exists("partprobe") {
-        let _ = Command::new("partprobe").arg(device).status();
+        _ = Command::new("partprobe").arg(device).status();
     } else if command_exists("blockdev") {
-        let _ = Command::new("blockdev")
+        _ = Command::new("blockdev")
             .arg("--rereadpt")
             .arg(device)
             .status();
     }
     if command_exists("udevadm") {
-        let _ = Command::new("udevadm")
+        _ = Command::new("udevadm")
             .args(["settle", "--timeout=5"])
             .status();
     }
@@ -1618,8 +1657,8 @@ where
         handle(event);
     }
 
-    let _ = out_thread.join();
-    let _ = err_thread.join();
+    _ = out_thread.join();
+    _ = err_thread.join();
 
     let status = child.wait().context("waiting for command")?;
     if status.success() {
@@ -1640,7 +1679,7 @@ fn install_bios_grub(
     if !command_exists("grub-install") {
         bail!("grub-install is required for BIOS support");
     }
-    log(emit, "Installing BIOS bootloader (GRUB)".to_string());
+    log(emit, "Installing BIOS bootloader (GRUB)".to_owned());
     let boot_dir = mount_root.join("boot");
     fs::create_dir_all(&boot_dir).context("creating boot directory")?;
 
@@ -1652,11 +1691,11 @@ fn install_bios_grub(
     let modules_arg = format!("--modules={}", modules.join(" "));
 
     let args = vec![
-        "--target=i386-pc".to_string(),
+        "--target=i386-pc".to_owned(),
         format!("--boot-directory={}", boot_dir.to_string_lossy()),
-        "--recheck".to_string(),
+        "--recheck".to_owned(),
         modules_arg,
-        device_path.to_string(),
+        device_path.to_owned(),
     ];
     run_cmd(emit, "grub-install", &args, "grub-install")?;
 
@@ -1688,14 +1727,14 @@ fn run_rsync_with_progress(
     let supports_progress2 = version.is_some_and(|v| v >= (3, 1, 0));
     let supports_no_inc = supports_progress2;
 
-    let mut args = vec!["-aH".to_string()];
+    let mut args = vec!["-aH".to_owned()];
     if supports_progress2 {
-        args.push("--info=progress2".to_string());
+        args.push("--info=progress2".to_owned());
         if supports_no_inc {
-            args.push("--no-inc-recursive".to_string());
+            args.push("--no-inc-recursive".to_owned());
         }
     } else {
-        args.push("--progress".to_string());
+        args.push("--progress".to_owned());
     }
     args.extend_from_slice(extra_args);
     args.push(format!("{path}/", path = src.to_string_lossy()));
@@ -1707,7 +1746,7 @@ fn run_rsync_with_progress(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    log(emit, "Running: rsync (progress)".to_string());
+    log(emit, "Running: rsync (progress)".to_owned());
 
     let mut child = cmd.spawn().context("spawning rsync")?;
     let stdout = child.stdout.take().context("capturing rsync stdout")?;
@@ -1726,8 +1765,8 @@ fn run_rsync_with_progress(
         emit(event);
     }
 
-    let _ = out_thread.join();
-    let _ = err_thread.join();
+    _ = out_thread.join();
+    _ = err_thread.join();
 
     let status = child.wait().context("waiting for rsync")?;
     if status.success() {
@@ -1746,12 +1785,12 @@ fn verify_tree_with_rsync(
     if !command_exists("rsync") {
         bail!("rsync is required for verification");
     }
-    log(emit, "Verifying files (rsync checksum)".to_string());
+    log(emit, "Verifying files (rsync checksum)".to_owned());
     let mut args = vec![
-        "-aH".to_string(),
-        "--checksum".to_string(),
-        "--dry-run".to_string(),
-        "--itemize-changes".to_string(),
+        "-aH".to_owned(),
+        "--checksum".to_owned(),
+        "--dry-run".to_owned(),
+        "--itemize-changes".to_owned(),
     ];
     args.extend_from_slice(extra_args);
     args.push(format!("{path}/", path = src.to_string_lossy()));
@@ -1770,14 +1809,14 @@ fn verify_tree_with_rsync(
     let mut diffs = Vec::new();
     for line in stdout.lines() {
         if is_rsync_verify_diff(line) {
-            diffs.push(line.to_string());
+            diffs.push(line.to_owned());
             if diffs.len() >= 5 {
                 break;
             }
         }
     }
     if diffs.is_empty() {
-        log(emit, "Verification OK".to_string());
+        log(emit, "Verification OK".to_owned());
         Ok(())
     } else {
         bail!("Verification failed: {}", diffs.join("; "));
@@ -1826,7 +1865,7 @@ fn verify_windows_install_media(
         if !dest.exists() {
             bail!("Install image missing after copy");
         }
-        log(emit, "Verifying install image checksum".to_string());
+        log(emit, "Verifying install image checksum".to_owned());
         let src_hash = sha256_file(&src)?;
         let dst_hash = sha256_file(&dest)?;
         if src_hash != dst_hash {
@@ -1848,7 +1887,7 @@ fn spawn_rsync_reader<R: Read + Send + 'static>(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut buf = [0u8; 4096];
+        let mut buf = [0_u8; 4096];
         let mut pending = String::new();
         let mut last_emit = Instant::now();
         loop {
@@ -1858,8 +1897,8 @@ fn spawn_rsync_reader<R: Read + Send + 'static>(
             }
             pending.push_str(&String::from_utf8_lossy(&buf[..read]));
             while let Some(idx) = find_line_break(&pending) {
-                let line = pending[..idx].to_string();
-                pending = pending[idx + 1..].to_string();
+                let line = pending[..idx].to_owned();
+                pending = pending[idx + 1..].to_owned();
                 handle_rsync_line(&line, &tx, &mut last_emit, emit_logs);
             }
         }
@@ -1876,7 +1915,7 @@ fn spawn_cmd_reader<R: Read + Send + 'static>(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut buf = [0u8; 4096];
+        let mut buf = [0_u8; 4096];
         let mut pending = String::new();
         loop {
             let read = reader.read(&mut buf).unwrap_or(0);
@@ -1885,8 +1924,8 @@ fn spawn_cmd_reader<R: Read + Send + 'static>(
             }
             pending.push_str(&String::from_utf8_lossy(&buf[..read]));
             while let Some(idx) = find_line_break(&pending) {
-                let line = pending[..idx].to_string();
-                pending = pending[idx + 1..].to_string();
+                let line = pending[..idx].to_owned();
+                pending = pending[idx + 1..].to_owned();
                 handle_cmd_line(&line, &tx, is_err);
             }
         }
@@ -1898,13 +1937,13 @@ fn spawn_cmd_reader<R: Read + Send + 'static>(
 
 fn handle_cmd_line(line: &str, tx: &mpsc::Sender<CmdEvent>, is_err: bool) {
     if let Some(frac) = parse_progress_percent(line) {
-        let _ = tx.send(CmdEvent::Progress(frac));
+        _ = tx.send(CmdEvent::Progress(frac));
         return;
     }
 
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if !trimmed.is_empty() {
-        let _ = tx.send(CmdEvent::Log(trimmed.to_string(), is_err));
+        _ = tx.send(CmdEvent::Log(trimmed.to_owned(), is_err));
     }
 }
 
@@ -1916,13 +1955,13 @@ fn handle_rsync_line(
 ) {
     if let Some(frac) = parse_progress_percent(line) {
         if last_emit.elapsed() >= Duration::from_millis(200) {
-            let _ = tx.send(UiEvent::Progress(frac));
+            _ = tx.send(UiEvent::Progress(frac));
             *last_emit = Instant::now();
         }
         if emit_logs && !is_rsync_progress_line(line) {
             let trimmed = line.trim_end_matches(['\r', '\n']);
             if !trimmed.is_empty() {
-                let _ = tx.send(UiEvent::Log(format!("rsync: {trimmed}")));
+                _ = tx.send(UiEvent::Log(format!("rsync: {trimmed}")));
             }
         }
         return;
@@ -1931,7 +1970,7 @@ fn handle_rsync_line(
     if emit_logs {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if !trimmed.is_empty() {
-            let _ = tx.send(UiEvent::Log(format!("rsync: {trimmed}")));
+            _ = tx.send(UiEvent::Log(format!("rsync: {trimmed}")));
         }
     }
 }
@@ -1989,7 +2028,7 @@ fn rsync_version() -> Option<(u32, u32, u32)> {
 }
 
 fn dir_size(root: &Path) -> Result<u64> {
-    let mut total = 0u64;
+    let mut total = 0_u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
         let metadata = fs::symlink_metadata(&path)
@@ -2002,8 +2041,15 @@ fn dir_size(root: &Path) -> Result<u64> {
                 let entry = entry?;
                 stack.push(entry.path());
             }
-        } else if file_type.is_file() || file_type.is_symlink() {
-            total = total.saturating_add(metadata.len());
+        } else {
+            #[allow(
+                clippy::filetype_is_file,
+                reason = "symlinks are explicitly handled in the disjunction; special files (sockets, fifos, device nodes) are correctly excluded from the size tally"
+            )]
+            let counted = file_type.is_file() || file_type.is_symlink();
+            if counted {
+                total = total.saturating_add(metadata.len());
+            }
         }
     }
     Ok(total)
@@ -2076,7 +2122,7 @@ fn sanitize_fat_label(label: &str) -> String {
         }
     }
     if sanitized.is_empty() {
-        "BOOTABLE".to_string()
+        "BOOTABLE".to_owned()
     } else {
         sanitized
     }
@@ -2094,9 +2140,9 @@ fn sanitize_ntfs_label(label: &str) -> String {
     }
     let trimmed = sanitized.trim();
     if trimmed.is_empty() {
-        "BOOTABLE".to_string()
+        "BOOTABLE".to_owned()
     } else {
-        trimmed.to_string()
+        trimmed.to_owned()
     }
 }
 
@@ -2337,7 +2383,10 @@ fn copy_grub_modules(arch: BootArch, esp_root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "long linear pipeline — see MODERNIZATION follow-up"
+)]
 fn install_uefi_ntfs_loaders(
     esp_root: &Path,
     ntfs_label: &str,
@@ -2353,8 +2402,8 @@ fn install_uefi_ntfs_loaders(
 
     fs::write(grub_dir.join("grub.cfg"), grub_cfg.as_bytes()).context("writing grub.cfg")?;
     let boot_grub_dir = esp_root.join("boot/grub");
-    fs::create_dir_all(&boot_grub_dir).ok();
-    let _ = fs::write(boot_grub_dir.join("grub.cfg"), grub_cfg.as_bytes());
+    _ = fs::create_dir_all(&boot_grub_dir);
+    _ = fs::write(boot_grub_dir.join("grub.cfg"), grub_cfg.as_bytes());
 
     let tmp_dir =
         std::env::var("XDG_RUNTIME_DIR").map_or_else(|_| std::env::temp_dir(), PathBuf::from);
@@ -2382,7 +2431,7 @@ fn install_uefi_ntfs_loaders(
                 format!("Signed GRUB modules missing, falling back to unsigned: {err}"),
             );
         } else {
-            log(emit, "Using signed shim/grub for x86_64".to_string());
+            log(emit, "Using signed shim/grub for x86_64".to_owned());
             copy_efi(&signed.shim, &grub_dir.join(BootArch::X64.boot_filename()))?;
             copy_efi(&signed.grub, &grub_dir.join(BootArch::X64.grub_filename()))?;
             if let Some(mok) = signed.mok {
@@ -2390,7 +2439,7 @@ fn install_uefi_ntfs_loaders(
                     mok.file_name()
                         .unwrap_or_else(|| std::ffi::OsStr::new("mmx64.efi")),
                 );
-                let _ = copy_efi(&mok, &target);
+                _ = copy_efi(&mok, &target);
             }
             secure_x64 = true;
         }
@@ -2421,14 +2470,14 @@ fn install_uefi_ntfs_loaders(
                 }
             } else {
                 log(emit, format!("Using signed shim/grub for {arch_label}"));
-                let _ = copy_efi(&signed.shim, &grub_dir.join(arch.boot_filename()));
-                let _ = copy_efi(&signed.grub, &grub_dir.join(arch.grub_filename()));
+                _ = copy_efi(&signed.shim, &grub_dir.join(arch.boot_filename()));
+                _ = copy_efi(&signed.grub, &grub_dir.join(arch.grub_filename()));
                 if let Some(mok) = signed.mok {
                     let target = grub_dir.join(
                         mok.file_name()
                             .unwrap_or_else(|| std::ffi::OsStr::new("mmx.efi")),
                     );
-                    let _ = copy_efi(&mok, &target);
+                    _ = copy_efi(&mok, &target);
                 }
                 continue;
             }
@@ -2468,11 +2517,11 @@ fn build_grub_standalone(
     emit: &mut dyn FnMut(UiEvent),
 ) -> Result<()> {
     let args = vec![
-        "-O".to_string(),
-        arch.grub_target().to_string(),
-        "-o".to_string(),
-        output_path.to_string_lossy().to_string(),
-        "--modules=part_gpt part_msdos fat ntfs chain search_fs_label".to_string(),
+        "-O".to_owned(),
+        arch.grub_target().to_owned(),
+        "-o".to_owned(),
+        output_path.to_string_lossy().into_owned(),
+        "--modules=part_gpt part_msdos fat ntfs chain search_fs_label".to_owned(),
         format!("boot/grub/grub.cfg={cfg}", cfg = cfg_path.to_string_lossy()),
     ];
     run_cmd(emit, "grub-mkstandalone", &args, "grub-mkstandalone")
@@ -2480,7 +2529,7 @@ fn build_grub_standalone(
 
 fn copy_efi(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).ok();
+        _ = fs::create_dir_all(parent);
     }
     fs::copy(src, dst).with_context(|| {
         format!(
@@ -2660,7 +2709,7 @@ mod tests {
 
     #[test]
     fn sha256_hex_valid_mixed_case() {
-        let hash = "aAbBcCdDeEfF0123456789".repeat(3)[..64].to_string();
+        let hash = "aAbBcCdDeEfF0123456789".repeat(3)[..64].to_owned();
         assert!(is_sha256_hex(&hash));
     }
 

@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::indexing_slicing,
+    reason = "UNITS is a fixed 5-element array and `unit` is bounded by the loop invariant `unit < UNITS.len() - 1`; f64 precision is adequate for display-range byte counts"
+)]
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = bytes as f64;

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use serde::Deserialize;
 use std::process::Command;
 
@@ -75,8 +75,8 @@ pub fn list_removable() -> Result<Vec<Device>> {
             },
         };
         let size = dev.size;
-        let size_display = size.map_or_else(|| "unknown".to_string(), format_bytes);
-        let model = dev.model.unwrap_or_else(|| "Unknown".to_string());
+        let size_display = size.map_or_else(|| "unknown".to_owned(), format_bytes);
+        let model = dev.model.unwrap_or_else(|| "Unknown".to_owned());
         let tran = dev.tran.unwrap_or_default();
         let display = if tran.is_empty() {
             format!("{path} • {size_display} • {model}")
@@ -192,10 +192,10 @@ mod tests {
         children: Option<Vec<BlockDevice>>,
     ) -> BlockDevice {
         BlockDevice {
-            name: Some(name.to_string()),
-            device_type: "disk".to_string(),
+            name: Some(name.to_owned()),
+            device_type: "disk".to_owned(),
             size: Some(1_000_000_000),
-            model: Some("Test".to_string()),
+            model: Some("Test".to_owned()),
             tran: tran.map(str::to_string),
             rm,
             path: path.map(str::to_string),
@@ -279,7 +279,7 @@ mod tests {
             Some("/dev/sda1"),
             None,
             None,
-            Some(vec![Some("/mnt/usb".to_string())]),
+            Some(vec![Some("/mnt/usb".to_owned())]),
             None,
         );
         let mut out = Vec::new();
@@ -296,7 +296,7 @@ mod tests {
             Some("/dev/sda1"),
             None,
             None,
-            Some(vec![Some("/mnt/data".to_string())]),
+            Some(vec![Some("/mnt/data".to_owned())]),
             None,
         );
         let parent = make_device("sda", Some("/dev/sda"), None, None, None, Some(vec![child]));
@@ -313,11 +313,7 @@ mod tests {
             Some("/dev/sda1"),
             None,
             None,
-            Some(vec![
-                Some(String::new()),
-                None,
-                Some("/mnt/usb".to_string()),
-            ]),
+            Some(vec![Some(String::new()), None, Some("/mnt/usb".to_owned())]),
             None,
         );
         let mut out = Vec::new();
@@ -341,7 +337,7 @@ mod tests {
             None, // no path
             None,
             None,
-            Some(vec![Some("/mnt/usb".to_string())]),
+            Some(vec![Some("/mnt/usb".to_owned())]),
             None,
         );
         let mut out = Vec::new();

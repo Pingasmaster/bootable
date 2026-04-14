@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::missing_assert_message,
+        clippy::create_dir,
+        reason = "tests use unwrap/expect/panic/indexing idiomatically — assertion failures are the whole point of a test"
+    )
+)]
 
 mod devices;
 mod helper;
@@ -6,7 +18,6 @@ mod util;
 mod writer;
 
 use adw::prelude::*;
-use gio::prelude::VolumeMonitorExt;
 use glib::clone;
 use gtk::{gdk, gio, glib};
 use std::cell::RefCell;
@@ -21,8 +32,14 @@ fn main() -> glib::ExitCode {
         return helper::run_helper(&plan_path);
     }
 
-    gio::resources_register_include!("bootable.gresource")
-        .expect("registering embedded gresource bundle");
+    #[allow(
+        clippy::expect_used,
+        reason = "bundle is embedded at build time by build.rs; a failure here means a miscompiled binary and panicking at startup is the correct behavior"
+    )]
+    {
+        gio::resources_register_include!("bootable.gresource")
+            .expect("registering embedded gresource bundle");
+    }
 
     let app = adw::Application::builder()
         .application_id("io.bootable.app")
@@ -37,7 +54,10 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "long linear pipeline — see MODERNIZATION follow-up"
+)]
 fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -259,7 +279,7 @@ fn build_ui(app: &adw::Application) {
 
     // ---------- Flash-in-progress banner ----------
     let flash_banner = adw::Banner::builder()
-        .title("Write in progress — device list refresh is paused")
+        .title("Write in progress - device list refresh is paused")
         .revealed(false)
         .build();
 
@@ -525,7 +545,7 @@ fn build_ui(app: &adw::Application) {
                             }
                             Err(err) => {
                                 append_log(&log_buffer, &format!("Error: {err}"));
-                                toast_overlay.add_toast(adw::Toast::new("Write failed — see log"));
+                                toast_overlay.add_toast(adw::Toast::new("Write failed - see log"));
                             }
                         }
                         *flashing.borrow_mut() = false;
@@ -600,7 +620,7 @@ fn build_ui(app: &adw::Application) {
 
     let start_action_cb =
         move |win: &adw::ApplicationWindow, _: &gio::SimpleAction, _: Option<&glib::Variant>| {
-            let iso_text = iso_row.text().to_string();
+            let iso_text = String::from(iso_row.text());
             if iso_text.trim().is_empty() {
                 toast_overlay.add_toast(adw::Toast::new("Select an image first"));
                 return;
@@ -668,14 +688,18 @@ fn build_ui(app: &adw::Application) {
                 } else {
                     FileSystem::Fat32
                 },
-                volume_label: volume_row.text().to_string(),
+                volume_label: volume_row.text().into(),
                 secure_boot_only: secure_row.is_active(),
                 verify_after: verify_row.is_active(),
                 checksum_sha256: non_empty_text(checksum_row.text().as_str()),
                 signature_path: non_empty_text(signature_row.text().as_str()).map(PathBuf::from),
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "SpinRow value is clamped to u32 range by its adjustment"
+                )]
                 persistence_size_mib: persistence_row.value() as u64,
-                persistence_label: persistence_label_row.text().to_string(),
+                persistence_label: persistence_label_row.text().into(),
                 dry_run,
             };
 
@@ -715,31 +739,31 @@ fn build_ui(app: &adw::Application) {
 
                 let sender = sender.clone();
                 let sender_panic = sender.clone();
-                let dry_run = plan.dry_run;
+                let worker_dry_run = plan.dry_run;
                 std::thread::spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if util::is_root() || dry_run {
+                        if util::is_root() || worker_dry_run {
                             let sender = sender.clone();
                             writer::run(&plan, move |event| {
-                                let _ = sender.send_blocking(event);
+                                _ = sender.send_blocking(event);
                             });
                         } else {
                             let sender_events = sender.clone();
                             let result = helper::run_helper_with_pkexec(&plan, move |event| {
-                                let _ = sender_events.send_blocking(event);
+                                _ = sender_events.send_blocking(event);
                             });
                             if let Err(err) = result {
-                                let _ = sender.send_blocking(UiEvent::Done(Err(err)));
+                                _ = sender.send_blocking(UiEvent::Done(Err(err)));
                             }
                         }
                     }));
                     if let Err(payload) = outcome {
                         let msg = payload
                             .downcast_ref::<&'static str>()
-                            .map(|s| (*s).to_string())
+                            .map(|s| (*s).to_owned())
                             .or_else(|| payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown panic".to_string());
-                        let _ = sender_panic.send_blocking(UiEvent::Done(Err(anyhow::anyhow!(
+                            .unwrap_or_else(|| "unknown panic".to_owned());
+                        _ = sender_panic.send_blocking(UiEvent::Done(Err(anyhow::anyhow!(
                             "Write worker panicked: {msg}"
                         ))));
                     }
@@ -759,7 +783,7 @@ fn build_ui(app: &adw::Application) {
     ]);
 
     let quit_action = gio::ActionEntry::builder("quit")
-        .activate(|app: &adw::Application, _, _| app.quit())
+        .activate(|application: &adw::Application, _, _| application.quit())
         .build();
     app.add_action_entries([quit_action]);
 
@@ -785,7 +809,7 @@ fn non_empty_text(s: &str) -> Option<String> {
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(trimmed.to_owned())
     }
 }
 
@@ -902,7 +926,7 @@ fn show_confirm_dialog(
         if response != "erase" {
             return;
         }
-        let typed = confirm_entry.text().to_string();
+        let typed = String::from(confirm_entry.text());
         if typed.trim() != device_path {
             error_label.set_text("Device path does not match.");
             return;
@@ -992,37 +1016,37 @@ mod tests {
 
     #[test]
     fn system_mount_block_root() {
-        let mounts = vec!["/".to_string()];
-        assert_eq!(system_mount_block(&mounts), Some("/".to_string()));
+        let mounts = vec!["/".to_owned()];
+        assert_eq!(system_mount_block(&mounts), Some("/".to_owned()));
     }
 
     #[test]
     fn system_mount_block_boot() {
-        let mounts = vec!["/boot".to_string()];
-        assert_eq!(system_mount_block(&mounts), Some("/boot".to_string()));
+        let mounts = vec!["/boot".to_owned()];
+        assert_eq!(system_mount_block(&mounts), Some("/boot".to_owned()));
     }
 
     #[test]
     fn system_mount_block_home() {
-        let mounts = vec!["/home".to_string()];
-        assert_eq!(system_mount_block(&mounts), Some("/home".to_string()));
+        let mounts = vec!["/home".to_owned()];
+        assert_eq!(system_mount_block(&mounts), Some("/home".to_owned()));
     }
 
     #[test]
     fn system_mount_block_safe_mount() {
-        let mounts = vec!["/mnt/usb".to_string()];
+        let mounts = vec!["/mnt/usb".to_owned()];
         assert_eq!(system_mount_block(&mounts), None);
     }
 
     #[test]
     fn system_mount_block_media_mount() {
-        let mounts = vec!["/media/user/USBDRIVE".to_string()];
+        let mounts = vec!["/media/user/USBDRIVE".to_owned()];
         assert_eq!(system_mount_block(&mounts), None);
     }
 
     #[test]
     fn system_mount_block_run_media() {
-        let mounts = vec!["/run/media/user/disk".to_string()];
+        let mounts = vec!["/run/media/user/disk".to_owned()];
         assert_eq!(system_mount_block(&mounts), None);
     }
 
@@ -1034,8 +1058,8 @@ mod tests {
 
     #[test]
     fn system_mount_block_mixed() {
-        let mounts = vec!["/mnt/usb".to_string(), "/var".to_string()];
-        assert_eq!(system_mount_block(&mounts), Some("/var".to_string()));
+        let mounts = vec!["/mnt/usb".to_owned(), "/var".to_owned()];
+        assert_eq!(system_mount_block(&mounts), Some("/var".to_owned()));
     }
 
     #[test]
@@ -1059,7 +1083,7 @@ mod tests {
             "/snap",
             "/nix",
         ] {
-            let mounts = vec![path.to_string()];
+            let mounts = vec![path.to_owned()];
             assert!(system_mount_block(&mounts).is_some(), "should block {path}");
         }
     }
@@ -1068,7 +1092,7 @@ mod tests {
     fn non_empty_text_handles_blanks() {
         assert_eq!(non_empty_text(""), None);
         assert_eq!(non_empty_text("   "), None);
-        assert_eq!(non_empty_text("value"), Some("value".to_string()));
-        assert_eq!(non_empty_text("  trim  "), Some("trim".to_string()));
+        assert_eq!(non_empty_text("value"), Some("value".to_owned()));
+        assert_eq!(non_empty_text("  trim  "), Some("trim".to_owned()));
     }
 }

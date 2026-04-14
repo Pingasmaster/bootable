@@ -35,13 +35,8 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (strict)
-        run: >
-          cargo clippy --all-targets --
-          -D warnings
-          -W clippy::pedantic
-          -W clippy::nursery
-          -W clippy::cargo
+      - name: cargo clippy (strict — lint levels defined in Cargo.toml [lints.clippy])
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test
