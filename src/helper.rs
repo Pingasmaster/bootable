@@ -177,7 +177,7 @@ fn write_plan(plan: &WritePlan) -> Result<PathBuf> {
         .tempfile_in(preferred_tmp_dir())
         .context("creating temp file")?;
     serde_json::to_writer(&mut file, plan).context("serializing plan")?;
-    file.flush().ok();
+    file.flush().context("flushing plan file")?;
     let (_file, path) = file.keep().context("persisting plan file")?;
     Ok(path)
 }

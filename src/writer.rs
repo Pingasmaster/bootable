@@ -218,7 +218,9 @@ fn detect_image_mode(path: &Path, emit: &mut dyn FnMut(UiEvent)) -> ImageMode {
 fn iso_listing(path: &Path) -> Option<String> {
     if command_exists("7z") {
         let output = Command::new("7z")
-            .args(["l", "-ba", path.to_string_lossy().as_ref()])
+            .arg("l")
+            .arg("-ba")
+            .arg(path)
             .output()
             .ok()?;
         if output.status.success() {
@@ -228,7 +230,8 @@ fn iso_listing(path: &Path) -> Option<String> {
 
     if command_exists("bsdtar") {
         let output = Command::new("bsdtar")
-            .args(["-tf", path.to_string_lossy().as_ref()])
+            .arg("-tf")
+            .arg(path)
             .output()
             .ok()?;
         if output.status.success() {
@@ -1389,11 +1392,7 @@ fn sanitize_ext4_label(label: &str) -> String {
 
 fn create_persistence_conf(partition: &str, emit: &mut dyn FnMut(UiEvent)) -> Result<()> {
     if !command_exists("mount") || !command_exists("umount") {
-        log(
-            emit,
-            "Persistence label is 'persistence' but mount tools are missing".to_string(),
-        );
-        return Ok(());
+        bail!("Persistence label is 'persistence' but mount/umount are missing — cannot write persistence.conf");
     }
     let mount_dir = tempfile::tempdir().context("creating persistence mount dir")?;
     let mount_args = vec![
@@ -2279,8 +2278,10 @@ fn install_uefi_ntfs_loaders(
     cfg_file
         .write_all(grub_cfg.as_bytes())
         .context("writing grub cfg")?;
-    cfg_file.flush().ok();
-    let (_file, cfg_path) = cfg_file.keep().context("persisting grub cfg")?;
+    cfg_file.flush().context("flushing grub cfg")?;
+    // Keep the NamedTempFile alive until the function returns so RAII
+    // cleans up the file on every early-return path.
+    let cfg_path = cfg_file.path().to_path_buf();
 
     let mut secure_x64 = false;
     if let Some(signed) = find_signed_bootloader(BootArch::X64) {
@@ -2377,7 +2378,7 @@ fn install_uefi_ntfs_loaders(
         }
     }
 
-    let _ = fs::remove_file(cfg_path);
+    drop(cfg_file);
     Ok(secure_x64)
 }
 
